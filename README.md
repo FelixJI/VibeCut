@@ -65,7 +65,7 @@ uv run pytest          # 全部测试：纯核心 + 真实 ffmpeg 合成夹具�
 ```
 
 合成夹具由测试内生成（方向标记全景图、luma 阶跃视频、正弦音轨经 stdin 喂给 ffmpeg），不读取任何用户素材。
-CI（`.github/workflows/ci.yml`）：GitHub ubuntu runner 自带 ffmpeg，`permissions: contents: read`，无 secret、无发布、无 `pull_request_target`、无模型下载，仅 CPU 合成测试。
+CI（`.github/workflows/ci.yml`）：从 Ubuntu 官方软件包安装 ffmpeg 并打印真实版本，不依赖 runner 预装；`permissions: contents: read`，无 secret、无发布、无 `pull_request_target`、无模型下载，仅 CPU 合成测试。
 
 ## 布局
 
@@ -81,7 +81,7 @@ tests/                纯核心测试 + ffmpeg 合成媒体测试
 
 - Python 3.12：PSF License；本机验证使用 CPython 3.12.12。
 - 运行时无第三方 Python 包。开发测试依赖 pytest（MIT）；构建依赖 hatchling（MIT），dev 的精确解析结果在 `uv.lock`，构建后端由隔离构建环境安装。
-- FFmpeg/ffprobe 是外部工具。本机实际验证为 9.0.2 essentials build，配置包含 `--enable-gpl --enable-version3`，因此该构建按 GPLv3 分发。CI 使用 runner 提供的版本并在日志打印真实版本；不同构建的完整 version/configuration 文本参与缓存身份。
+- FFmpeg/ffprobe 是外部工具。本机实际验证为 9.0.2 essentials build，配置包含 `--enable-gpl --enable-version3`，因此该构建按 GPLv3 分发。CI 使用 Ubuntu 软件包版本并在日志打印真实版本；不同构建的完整 version/configuration 文本参与缓存身份。
 - 此处记录依赖许可，不替 VibeCut 项目选择开源许可；本任务不打包或再分发 FFmpeg。
 
 本机验证入口（仓库根目录，已准备 `.venv`，无需重新解析依赖）：

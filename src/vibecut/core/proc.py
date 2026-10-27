@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import BinaryIO, Mapping, Optional, Sequence
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -207,12 +207,15 @@ def run_bounded(
     poll_interval_s: float = 0.05,
     pipe_join_s: float = 2.0,
     hard_kill_after_s: float = 3.0,
+    stdout_file: Optional[BinaryIO] = None,
 ) -> ProcResult:
     """Run ``argv`` with bounded lifetime, bounded pipe memory and tree kill.
 
     ``timeout_s`` bounds execution; cleanup has at most two
     ``hard_kill_after_s`` waits and one shared ``pipe_join_s`` drain budget.
     Descendants are reclaimed even if the direct child has already exited.
+    ``stdout_file`` redirects large output to a caller-owned binary file;
+    its handle remains caller-owned and stdout_tail is empty in that mode.
     """
     argv = tuple(str(a) for a in argv)
     if not argv:
@@ -226,7 +229,7 @@ def run_bounded(
     if not isinstance(tail_limit, int) or tail_limit < 0:
         raise ProcessError("tail_limit must be a non-negative integer")
     popen_kwargs: dict = dict(
-        stdout=subprocess.PIPE,
+        stdout=stdout_file if stdout_file is not None else subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
         cwd=cwd,
@@ -273,6 +276,8 @@ def run_bounded(
         if IS_WINDOWS:
             _resume_process(proc)
         for stream, buf in ((proc.stdout, out_buf), (proc.stderr, err_buf)):
+            if stream is None:
+                continue
             reader = threading.Thread(target=_pump, args=(stream, buf), daemon=True)
             reader.start()
             readers.append(reader)

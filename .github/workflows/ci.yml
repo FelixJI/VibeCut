@@ -18,10 +18,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify bundled ffmpeg (no downloads, no secrets)
+      - name: Install and verify FFmpeg from Ubuntu packages
+        shell: bash
         run: |
-          ffmpeg -hide_banner -version | head -n 2
-          ffprobe -hide_banner -version | head -n 1
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
 
       - name: Install uv + pinned Python 3.12
         uses: astral-sh/setup-uv@v5

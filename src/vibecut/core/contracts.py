@@ -317,6 +317,9 @@ class NormalizedAsset:
     color: ColorContract
     stabilization_provenance: str = "none"  # mirrors the source provenance for derived assets
 
+    def __post_init__(self) -> None:
+        _require(self.schema_version == CONTRACT_VERSION, "unsupported schema_version")
+
     def to_json(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -387,6 +390,7 @@ class CameraPath:
     provenance: str = "user"
 
     def __post_init__(self) -> None:
+        _require(self.schema_version == CONTRACT_VERSION, "unsupported schema_version")
         _require(len(self.keys) >= 1, "camera path needs at least one key")
         _require(self.provenance in ("user", "derived"), "camera provenance must be 'user' or 'derived'")
         times = [t for t, _ in self.keys]

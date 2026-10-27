@@ -146,6 +146,7 @@ def build_ffmpeg_argv(
     view = plan.camera.static_view
     vf = v360_filter(view, config.out_width, config.out_height)
     args = [
+        "-xerror", "-err_detect", "explode",
         "-ss", _dec(seek_target),
         "-i", source.path,
         "-t", _dec(duration),

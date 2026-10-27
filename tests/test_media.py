@@ -689,3 +689,101 @@ def test_render_abort_after_work_cleans_own_temp(tools, tmp_path, monkeypatch, p
     assert not (tmp_path / "out.mp4").exists()
     assert not list(tmp_path.glob("*.partial"))
     assert all(event[0] != "committed" for event in result.events)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("offset", [Fraction(0), Fraction(3, 2)])
+def test_edit_list_preroll_is_not_display_duration(tools, tmp_path, offset):
+    original = tmp_path / "original.mp4"
+    result = run_ffmpeg(tools, [
+        "-f", "lavfi", "-i", "testsrc2=size=320x160:rate=30", "-frames:v", "60",
+        "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p",
+        "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+        "-colorspace", "bt709", "-color_range", "tv", str(original),
+    ])
+    assert result.returncode == 0, result.stderr
+    trimmed = tmp_path / "trimmed.mp4"
+    result = run_ffmpeg(tools, ["-ss", "0.5", "-i", str(original), "-c", "copy", str(trimmed)])
+    assert result.returncode == 0, result.stderr
+    if offset:
+        # Add a leading empty edit while preserving the real preroll edit.
+        # FFmpeg's output_ts_offset instead exposes those preroll packets.
+        import struct
+        data = bytearray(trimmed.read_bytes())
+        def box(name):
+            index = data.index(name)
+            assert index == data.rindex(name), "fixture requires one unfragmented video track"
+            return index
+        moov, trak, edts, elst = [box(name) for name in (b"moov", b"trak", b"edts", b"elst")]
+        mvhd, tkhd = box(b"mvhd"), box(b"tkhd")
+        assert moov > box(b"mdat"), "fixture moov must follow media data"
+        assert data[elst + 4] == data[mvhd + 4] == data[tkhd + 4] == 0
+        assert int.from_bytes(data[elst + 8:elst + 12], "big") == 1
+        timescale = int.from_bytes(data[mvhd + 16:mvhd + 20], "big")
+        delay = offset * timescale
+        assert delay.denominator == 1
+        for index in (moov, trak, edts, elst):
+            size = int.from_bytes(data[index - 4:index], "big")
+            data[index - 4:index] = (size + 12).to_bytes(4, "big")
+        for index in (mvhd + 20, tkhd + 24):
+            duration = int.from_bytes(data[index:index + 4], "big")
+            data[index:index + 4] = (duration + int(delay)).to_bytes(4, "big")
+        data[elst + 8:elst + 12] = (2).to_bytes(4, "big")
+        data[elst + 12:elst + 12] = struct.pack(">IiHH", int(delay), -1, 1, 0)
+        trimmed.write_bytes(data)
+    packets = subprocess.run(tools.ffprobe_argv(
+        "-show_packets", "-show_entries", "packet=pts,flags", "-of", "json", str(trimmed)),
+        capture_output=True, check=True, timeout=15)
+    discard = [p for p in json.loads(packets.stdout)["packets"] if "D" in p["flags"]]
+    assert len(discard) == 15
+    minimum = min(int(p["pts"]) for p in discard)
+    assert minimum > 0 if offset else minimum < 0
+    source = probe_source(trimmed, tools, declared_projection="equirect")
+    assert source.video.first_frame_seconds() == offset
+    assert source.timeline_origin == offset
+    assert source.video.nb_frames == 45, "discard preroll packets are not displayed frames"
+    assert make_plan(source).duration_rel == Fraction(3, 2)
+    before = content_fingerprint(trimmed)
+    render_ok(tools, source, make_plan(source), tmp_path / "flat.mp4")
+    proxy = ensure_proxy(source, tools, Cache(tmp_path / "cache"))
+    assert Path(proxy.path).is_file()
+    assert content_fingerprint(trimmed) == before
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("entry", ["render", "proxy"])
+def test_corrupt_packet_never_becomes_success(tools, tmp_path, entry):
+    src = tmp_path / "corrupt-packet.mp4"
+    result = run_ffmpeg(tools, [
+        "-f", "lavfi", "-i", "testsrc2=size=320x160:rate=30", "-frames:v", "60",
+        "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p",
+        "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+        "-colorspace", "bt709", "-color_range", "tv", str(src),
+    ])
+    assert result.returncode == 0, result.stderr
+    packets = subprocess.run(tools.ffprobe_argv(
+        "-show_packets", "-show_entries", "packet=pos,size", "-of", "json", str(src)),
+        capture_output=True, check=True, timeout=15)
+    packet = json.loads(packets.stdout)["packets"][20]
+    data = bytearray(src.read_bytes())
+    start, size = int(packet["pos"]), int(packet["size"])
+    data[start:start + size] = bytes(size)
+    src.write_bytes(data)
+    rejected = run_ffmpeg(tools, ["-xerror", "-i", str(src), "-f", "null", "-"])
+    assert rejected.returncode != 0, "fixture must contain a real decode error"
+    source = probe_source(src, tools, declared_projection="equirect")
+    before = src.read_bytes()
+    existing = tmp_path / "existing.mp4"
+    existing.write_bytes(b"previous valid artifact")
+    cache = Cache(tmp_path / "cache")
+    if entry == "render":
+        result = render_static(make_plan(source), source, tools, tmp_path / "out.mp4", cache=cache)
+        assert result.status == "failed", result
+        assert not (tmp_path / "out.mp4").exists()
+    else:
+        from vibecut.render.static import ExportError
+        with pytest.raises(ExportError):
+            ensure_proxy(source, tools, cache)
+    assert src.read_bytes() == before and existing.read_bytes() == b"previous valid artifact"
+    assert not list(tmp_path.glob("*.partial"))
+    assert not cache.root.exists() or not list(cache.root.iterdir())

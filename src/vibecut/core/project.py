@@ -115,6 +115,14 @@ class Project:
             raise ProjectFormatError(
                 f"unsupported project schema_version {raw.get('project_schema_version')!r}"
             )
+        # The payload's contract_schema_version pins the versioned contract
+        # objects nested inside (sources/assets/plans/jobs). Loading a file
+        # from an unknown contract schema and re-saving would silently
+        # downgrade it (and drop future fields), so reject it up front.
+        if raw.get("contract_schema_version") != CONTRACT_VERSION:
+            raise ProjectFormatError(
+                f"unsupported contract_schema_version {raw.get('contract_schema_version')!r}"
+            )
         try:
             project = cls(
                 path=path,

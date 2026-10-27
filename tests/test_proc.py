@@ -212,7 +212,8 @@ def test_setup_and_runtime_failures_reap_child(monkeypatch, tmp_path, stage):
     elif stage == "reader":
         monkeypatch.setattr(proc_module.threading.Thread, "start", fail)
     else:
-        monkeypatch.setattr(proc_module.time, "sleep", fail)
+        from types import SimpleNamespace
+        monkeypatch.setattr(proc_module, "time", SimpleNamespace(monotonic=time.monotonic, sleep=fail))
     marker = tmp_path / "executed"
     script = f"from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(60)"
     with pytest.raises(RuntimeError, match="injected failure"):
@@ -235,6 +236,17 @@ def test_job_creation_failure_does_not_spawn(monkeypatch):
     monkeypatch.setattr(proc_module.subprocess, "Popen", unexpected_spawn)
     with pytest.raises(proc_module.ProcessError, match="injected job failure"):
         run_bounded([PY, "-c", "pass"], timeout_s=1)
+
+
+def test_large_stdout_file_keeps_stderr_bounded_and_caller_handle_open(tmp_path):
+    path = tmp_path / "controlled-output"
+    script = "import sys; sys.stderr.buffer.write(b'e'*2000000); sys.stdout.buffer.write(b'x'*2000000)"
+    with path.open("xb") as output:
+        result = run_bounded([PY, "-c", script], timeout_s=10, tail_limit=4096, stdout_file=output)
+        assert not output.closed
+    assert result.returncode == 0 and result.pipes_drained
+    assert result.stdout_tail == b"" and result.stderr_tail == b"e" * 4096
+    assert path.read_bytes() == b"x" * 2000000
 
 
 def test_runtime_failure_reaps_already_spawned_descendant(monkeypatch, tmp_path):

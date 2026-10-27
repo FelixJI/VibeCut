@@ -21,7 +21,7 @@ import hashlib
 import json
 import os
 import re
-import sys
+import threading
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +34,7 @@ from vibecut.core.contracts import (
     VideoStream,
     parse_frac,
 )
+from vibecut.core.proc import run_bounded
 from vibecut.media.ffmpeg import FFmpegTools
 
 PROBE_TIMEOUT_S = 30.0
@@ -125,7 +126,7 @@ def structured_projection(probe: dict[str, Any]) -> Optional[str]:
         tag = str((stream.get("tags") or {}).get("ProjectionType", "") or "").lower()
         if tag:
             findings.append(tag)
-    distinct = {f for f in findings}
+    distinct = {"equirect" if f in _EQUIRECT_PROJECTION_VALUES else f for f in findings}
     if not distinct:
         return None
     if len(distinct) == 1:
@@ -138,65 +139,66 @@ def structured_projection(probe: dict[str, Any]) -> Optional[str]:
     raise UnsupportedSourceError(f"contradictory projection metadata: {sorted(distinct)}")
 
 
-def _run_ffprobe_to_tempfile(argv: list[str], *, timeout_s: float) -> Path:
+def _run_ffprobe_to_tempfile(
+    argv: list[str], *, timeout_s: float, cancel_event: Optional[threading.Event] = None,
+) -> Path:
     """Run ffprobe with stdout redirected to a controlled temp file.
 
     Used instead of a pipe when the output may exceed the bounded pipe tail
     (e.g. full packet tables): the temp file lives in the system temp dir,
-    belongs exclusively to this call, is removed afterwards, and ffprobe is a
-    leaf tool - a hard kill on timeout cannot orphan work we depend on.
-    Bounded: argv only (no shell), overall timeout, stderr read is capped.
+    belongs exclusively to this call, and is removed by the consumer after
+    success or here on every failure. All process ownership, stderr draining
+    and bounded cleanup use the shared runner.
     """
-    import subprocess
     import tempfile
-    import time
 
     fd, tmp_name = tempfile.mkstemp(prefix="vibecut-ffprobe-", suffix=".txt")
-    os.close(fd)
     tmp = Path(tmp_name)
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    proc = subprocess.Popen(argv, stdout=open(tmp, "wb"), stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, creationflags=creationflags)
-    deadline = time.monotonic() + timeout_s
-    while proc.poll() is None:
-        if time.monotonic() > deadline:
-            proc.kill()
-            proc.wait(timeout=5)
-            tmp.unlink(missing_ok=True)
-            raise ProbeError(f"ffprobe timed out after {timeout_s}s: {argv[:2]}")
-        time.sleep(0.02)
-    err = proc.stderr.read(65536) if proc.stderr else b""
-    proc.stderr.close() if proc.stderr else None
-    if proc.returncode != 0:
+    try:
+        with os.fdopen(fd, "wb") as output:
+            result = run_bounded(argv, timeout_s=timeout_s, cancel_event=cancel_event,
+                                 stdout_file=output)
+        if result.timed_out or result.cancelled or result.returncode != 0:
+            tail = result.stderr_tail.decode("utf-8", "replace")[-500:].strip()
+            raise ProbeError(
+                f"ffprobe failed (rc={result.returncode}, timeout={result.timed_out}, "
+                f"cancelled={result.cancelled}): {tail}"
+            )
+        return tmp
+    except BaseException:
         tmp.unlink(missing_ok=True)
-        tail = err.decode("utf-8", "replace")[-500:].strip()
-        raise ProbeError(f"ffprobe failed (rc={proc.returncode}): {tail}")
-    return tmp
+        raise
 
 
 def _video_packet_pts(tools: FFmpegTools, path: Path, stream_index: int) -> list[int]:
-    """Exact PTS list (stream timebase units) of the video stream's packets.
+    """Exact displayed-packet PTS, excluding decoder-only edit-list preroll.
 
-    ffprobe writes bare CSV values (one per line) to a controlled temp file;
+    FFmpeg's packet D flag denotes discard, including positive-PTS preroll.
+    Keep those packets available to the decoder but out of display timing.
+    ffprobe writes compact fields (one per line) to a controlled temp file;
     parsing is streamed line-by-line so memory stays bounded per line no
     matter how many packets the file has (pipe tails would truncate).
     """
     argv = list(tools.ffprobe_argv(
-        "-of", "csv=p=0", "-select_streams", str(stream_index),
-        "-show_packets", "-show_entries", "packet=pts", "-i", str(path),
+        "-of", "compact=p=0:nk=0", "-select_streams", str(stream_index),
+        "-show_packets", "-show_entries", "packet=pts,flags", "-i", str(path),
     ))
     tmp = _run_ffprobe_to_tempfile(argv, timeout_s=PROBE_TIMEOUT_S)
     pts: list[int] = []
     try:
         with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:  # streaming: bounded memory per line
-                value = line.strip()
-                if not value or value in ("N/A", "AV_NOPTS_VALUE"):
+                if not line.strip():
+                    continue
+                fields = dict(part.split("=", 1) for part in line.strip().split("|") if "=" in part)
+                if "flags" not in fields:
+                    raise ProbeError("ffprobe packet is missing discard flags")
+                if "D" in fields["flags"]:
                     continue
                 try:
-                    pts.append(int(value))
-                except ValueError:
-                    continue
+                    pts.append(int(fields["pts"]))
+                except (KeyError, ValueError) as exc:
+                    raise UnsupportedSourceError("displayed packet has no usable PTS") from exc
     finally:
         tmp.unlink(missing_ok=True)
     return sorted(pts)
@@ -210,10 +212,9 @@ def _verify_cfr(pts: list[int], time_base: Fraction, avg_frame_rate: Fraction, s
     * non-uniform PTS spacing => VFRDetectedError regardless of any rate
       metadata (r/avg frame-rate fields are recorded but never trusted);
     * exact fps implied by the PTS lattice must equal avg_frame_rate;
-    * the first displayed frame comes from the edit-list-aware stream
-      start_pts when ffprobe provides one that is consistent with the actual
-      packets (min <= start_pts <= max); otherwise from min packet PTS.
-      stream.start_pts is verified, never blindly trusted.
+    * the first displayed frame is the earliest non-discard packet PTS;
+      stream.start_pts must agree within one timebase tick (edit-list
+      rounding), rather than selecting an arbitrary later displayed frame.
     """
     if len(pts) < 2:
         raise UnsupportedSourceError("fewer than 2 timestamped video packets; cannot verify frame timing")
@@ -234,16 +235,12 @@ def _verify_cfr(pts: list[int], time_base: Fraction, avg_frame_rate: Fraction, s
             f"frame PTS imply fps {exact_fps} but container reports avg_frame_rate {avg_frame_rate}; "
             "time mapping is inconsistent and the source is rejected"
         )
-    if stream_start_pts is not None and pts[0] - 1 <= stream_start_pts <= pts[-1]:
-        first = stream_start_pts
-    elif stream_start_pts is not None:
+    if stream_start_pts is not None and abs(stream_start_pts - pts[0]) > 1:
         raise UnsupportedSourceError(
             f"stream start_pts {stream_start_pts} inconsistent with packet PTS range [{pts[0]}, {pts[-1]}]; "
             "cannot establish the first displayed frame"
         )
-    else:
-        first = pts[0]
-    return first, exact_fps
+    return pts[0], exact_fps
 
 
 def _check_color(vs: dict[str, Any]) -> ColorContract:

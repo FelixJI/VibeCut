@@ -36,7 +36,7 @@ def _proxy_key(source: MediaSource, tools: FFmpegTools, width: int, height: int)
         tool_identity=tools.identity(),
         kind="proxy",
         color=source.color.to_json(),
-        config={"pipeline": "proxy-v2", "width": width, "height": height, "scale": "bicubic",
+        config={"pipeline": "proxy-v3-strict-decode", "width": width, "height": height, "scale": "bicubic",
                 "video": "libx264-crf23", "space": "canonical-equirect-mono",
                 "stabilization_provenance": source.stabilization_provenance},
     )
@@ -97,6 +97,7 @@ def ensure_proxy(
     tmp = Path(name)
     try:
         argv = tools.ffmpeg_argv(
+            "-xerror", "-err_detect", "explode",
             "-i", source.path, "-map", f"0:{source.video.index}", "-an",
             "-vf", f"scale={width}:{height}:flags=bicubic",
             "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-pix_fmt", "yuv420p",

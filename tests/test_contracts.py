@@ -10,6 +10,7 @@ from vibecut.core.contracts import (
     CameraPath,
     CameraView,
     ColorContract,
+    ContractError,
     EditPlan,
     JobEvent,
     MediaSource,
@@ -115,9 +116,33 @@ def test_job_event_roundtrip_and_statuses():
 
 def test_normalized_asset_time_map():
     tm = TimeMap(asset_start_source_rel=Fraction(1, 2), fps=Fraction(30000, 1001))
-    asset = NormalizedAsset(1, "v1:xy", "proxy", "v1:ab", "p.mp4", tm,
+    asset = NormalizedAsset(CONTRACT_VERSION, "v1:xy", "proxy", "v1:ab", "p.mp4", tm,
                             ColorContract("bt709", "bt709", "bt709", "tv", 8))
     again = NormalizedAsset.from_json(asset.to_json())
     assert again.time_map.asset_start_source_rel == Fraction(1, 2)
     assert again.time_map.fps == Fraction(30000, 1001)
     assert again.stabilization_provenance == "none"
+
+
+def test_camera_path_rejects_unknown_schema_version():
+    view = CameraView(yaw_deg=0.0)
+    with pytest.raises(ContractError):
+        CameraPath(schema_version=999, keys=((Fraction(0), view),), provenance="user")
+    bad = {
+        "schema_version": 999,
+        "keys": [["0/1", view.to_json()]],
+        "provenance": "user",
+    }
+    with pytest.raises(ContractError):
+        CameraPath.from_json(bad)  # unknown versions must not parse silently
+
+
+def test_normalized_asset_rejects_unknown_schema_version():
+    tm = TimeMap(asset_start_source_rel=Fraction(0), fps=Fraction(30))
+    color = ColorContract("bt709", "bt709", "bt709", "tv", 8)
+    with pytest.raises(ContractError):
+        NormalizedAsset(999, "v1:xy", "proxy", "v1:ab", "p.mp4", tm, color)
+    good = NormalizedAsset(CONTRACT_VERSION, "v1:xy", "proxy", "v1:ab", "p.mp4", tm, color)
+    bad = {**good.to_json(), "schema_version": 999}
+    with pytest.raises(ContractError):
+        NormalizedAsset.from_json(bad)
