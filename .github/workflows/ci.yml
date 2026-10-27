@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: core + synthetic media tests (CPU only, Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out sources (read-only token)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify bundled ffmpeg (no downloads, no secrets)
+        run: |
+          ffmpeg -hide_banner -version | head -n 2
+          ffprobe -hide_banner -version | head -n 1
+
+      - name: Install uv + pinned Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Install project (locked deps, stdlib-only runtime)
+        run: uv sync --frozen
+
+      - name: Run tests (real ffmpeg on synthetic CPU fixtures; skips forbidden)
+        env:
+          VIBECUT_REQUIRE_FFMPEG: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run pytest -v -p no:cacheprovider

@@ -1,0 +1,23 @@
+[project]
+name = "vibecut"
+version = "0.1.0"
+description = "VibeCut static pipeline: monocular equirectangular SDR MP4 -> fixed-view flat 1920x1080 H.264/AAC/BT.709 export"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+vibecut = "vibecut.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vibecut"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
