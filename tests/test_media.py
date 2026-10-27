@@ -279,15 +279,27 @@ def test_unicode_and_spaces_paths(tools, tmp_path):
 @requires_ffmpeg
 def test_vfr_rejected_fail_fast(tools, tmp_path):
     out = tmp_path / "vfr.mp4"
+    # -fps_mode passthrough keeps the setpts timestamps: FFmpeg 6.x's default
+    # regularises them back to CFR and the fixture stops being VFR (CI 6.1.1).
     res = run_ffmpeg(tools, [
         "-f", "lavfi", "-i", "testsrc2=s=320x160:r=30",
         "-vf", "setpts='(N+floor(N/6)*0.5)/30/TB'",
+        "-fps_mode", "passthrough",
         "-frames:v", "30", "-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p",
         "-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709",
         "-colorspace", "bt709", "-color_range", "tv",
         "-map_metadata", "-1", "-y", str(out),
     ])
     assert res.returncode == 0, res.stderr.decode("utf-8", "replace")
+    # self-check: displayed packet PTS intervals must really be non-uniform,
+    # else the VFRDetectedError assertion below would be vacuously green.
+    packets = subprocess.run(tools.ffprobe_argv(
+        "-show_packets", "-show_entries", "packet=pts,flags", "-of", "json", str(out)),
+        capture_output=True, check=True, timeout=15)
+    pts = sorted(int(p["pts"]) for p in json.loads(packets.stdout)["packets"]
+                 if "D" not in p["flags"])
+    deltas = {b - a for a, b in zip(pts, pts[1:])}
+    assert len(deltas) > 1, f"fixture must be genuinely VFR, got uniform PTS deltas {deltas}"
     with pytest.raises(VFRDetectedError):
         probe_source(out, tools, declared_projection="equirect")
 
@@ -769,8 +781,12 @@ def test_corrupt_packet_never_becomes_success(tools, tmp_path, entry):
     start, size = int(packet["pos"]), int(packet["size"])
     data[start:start + size] = bytes(size)
     src.write_bytes(data)
+    # Prove corruption from error-level stderr, not the exit code: rc for
+    # recoverable decode errors is version-dependent (6.1.1 rc=0, 9.0.2 non-zero).
     rejected = run_ffmpeg(tools, ["-xerror", "-i", str(src), "-f", "null", "-"])
-    assert rejected.returncode != 0, "fixture must contain a real decode error"
+    diag = rejected.stderr.decode("utf-8", "replace").strip()
+    assert rejected.returncode != 0 or diag, \
+        "fixture must exhibit a real decode error (non-zero exit or error-level stderr)"
     source = probe_source(src, tools, declared_projection="equirect")
     before = src.read_bytes()
     existing = tmp_path / "existing.mp4"
@@ -787,3 +803,67 @@ def test_corrupt_packet_never_becomes_success(tools, tmp_path, entry):
     assert src.read_bytes() == before and existing.read_bytes() == b"previous valid artifact"
     assert not list(tmp_path.glob("*.partial"))
     assert not cache.root.exists() or not list(cache.root.iterdir())
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("entry", ["render", "proxy", "cachehit"])
+def test_rc0_with_error_stderr_never_succeeds(tools, tmp_path, monkeypatch, entry):
+    """rc=0 plus error-level stderr must be rejected (simulated exit contract).
+
+    Why: some FFmpeg builds (6.1.x on CI) exit rc=0 while stderr carries real
+    decode errors, and ffmpeg_argv pins -loglevel error, so any stderr line
+    must fail the run. The diagnostics are SIMULATED onto a real, clean local
+    9.0.2 run; this is not a Linux 6.1.1 real run (that stays with CI).
+    """
+    from dataclasses import replace
+
+    from vibecut.render.static import ArtifactProcessError, ExportError
+
+    simulated_stderr = (
+        b"[h264 @ 0x55f54c2b4e00] Invalid NAL unit size (0 > 644)\n"
+        b"[h264 @ 0x55f54c2b4e00] Error submitting packet to decoder\n"
+        b"[h264 @ 0x55f54c2b4e00] Decoder thread returned error\n"
+    )
+    src = make_marker_equirect(tools, tmp_path / "good.mp4", yaw_deg=0.0, pitch_deg=0.0)
+    source = probe_source(src, tools, declared_projection="equirect")
+    before = src.read_bytes()
+    existing = tmp_path / "existing.mp4"
+    existing.write_bytes(b"previous valid artifact")
+    cache = Cache(tmp_path / "cache")
+    real_run = FFmpegTools.run
+    if entry == "cachehit":
+        # build a REAL hot cache first; only its full-decode validation is poisoned below
+        payload = Path(ensure_proxy(source, tools, cache).path)
+        payload_bytes = payload.read_bytes()
+
+    def run(self, argv, **kwargs):
+        result = real_run(self, argv, **kwargs)
+        # inject only into production calls: the encode (.partial/.mp4 output)
+        # or, for cachehit, the full-decode validation (output "-")
+        production = str(argv[-1]).endswith((".partial", ".mp4")) or (
+            entry == "cachehit" and str(argv[-1]) == "-"
+        )
+        if str(argv[0]) == str(self.ffmpeg) and production:
+            assert result.returncode == 0 and not result.stderr_tail, \
+                "simulation precondition: the real run must be clean"
+            return replace(result, returncode=0, stderr_tail=simulated_stderr)
+        return result
+
+    monkeypatch.setattr(FFmpegTools, "run", run)
+    if entry == "render":
+        result = render_static(make_plan(source), source, tools, tmp_path / "out.mp4", cache=cache)
+        assert result.status == "failed" and "rc=0" in result.error and "Invalid NAL unit size" in result.error
+        assert not (tmp_path / "out.mp4").exists()
+        assert not cache.root.exists() or not list(cache.root.iterdir())
+    elif entry == "proxy":
+        with pytest.raises(ArtifactProcessError, match="Invalid NAL unit size"):
+            ensure_proxy(source, tools, cache)
+        assert not cache.root.exists() or not list(cache.root.iterdir())
+    else:  # cachehit: the hot cache's full decode is poisoned, not its bytes
+        with pytest.raises(ExportError, match="Invalid NAL unit size"):
+            ensure_proxy(source, tools, cache)
+        assert payload.is_file() and payload.read_bytes() == payload_bytes, \
+            "rejection must preserve the existing cached payload"
+        assert list(cache.root.glob("*.json")), "cache manifest must survive the rejected hit"
+    assert src.read_bytes() == before and existing.read_bytes() == b"previous valid artifact"
+    assert not list(tmp_path.glob("*.partial"))

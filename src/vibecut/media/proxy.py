@@ -36,7 +36,7 @@ def _proxy_key(source: MediaSource, tools: FFmpegTools, width: int, height: int)
         tool_identity=tools.identity(),
         kind="proxy",
         color=source.color.to_json(),
-        config={"pipeline": "proxy-v3-strict-decode", "width": width, "height": height, "scale": "bicubic",
+        config={"pipeline": "proxy-v4-error-level-stderr", "width": width, "height": height, "scale": "bicubic",
                 "video": "libx264-crf23", "space": "canonical-equirect-mono",
                 "stabilization_provenance": source.stabilization_provenance},
     )
@@ -72,8 +72,13 @@ def ensure_proxy(
             tools.ffmpeg_argv("-xerror", "-i", str(target), "-map", "0:v:0", "-f", "null", "-"),
             timeout_s=timeout_s, cancel_event=cancel_event,
         )
-        if decoded.returncode != 0 or decoded.cancelled or decoded.timed_out:
-            raise ExportError("proxy payload could not be completely decoded")
+        # -loglevel error is pinned by ffmpeg_argv: any stderr line proves a
+        # decode error even on builds (6.1.x) that exit rc=0.
+        diag = decoded.stderr_tail.decode("utf-8", "replace").strip()[-300:]
+        if decoded.returncode != 0 or decoded.cancelled or decoded.timed_out or diag:
+            raise ExportError(
+                "proxy payload could not be completely decoded" + (f": {diag}" if diag else "")
+            )
         check_source()
 
     def asset(payload: Path) -> NormalizedAsset:
@@ -108,8 +113,10 @@ def ensure_proxy(
         res = tools.run(argv, timeout_s=timeout_s, cancel_event=cancel_event)
         if res.cancelled:
             raise ExportError("proxy render cancelled")
-        if res.timed_out or res.returncode != 0:
-            tail = res.stderr_tail.decode("utf-8", "replace")[-500:].strip()
+        # rc=0 + non-empty stderr is still a failure: ffmpeg_argv pins
+        # -loglevel error, so any stderr byte is error-level evidence.
+        tail = res.stderr_tail.decode("utf-8", "replace").strip()[-500:]
+        if res.timed_out or res.returncode != 0 or tail:
             raise ArtifactProcessError(f"proxy ffmpeg rc={res.returncode}: {tail}")
         check_source()
         payload = cache.put_atomic(

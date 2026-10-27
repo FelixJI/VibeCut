@@ -275,8 +275,10 @@ def render_static(
         if res.cancelled:
             events.append(("cancelled", f"duration={res.duration_s:.2f}s"))
             return RenderResult(job_id=job_id, status="cancelled", cache_key=cache_key, events=tuple(events))
-        if res.timed_out or res.returncode != 0:
-            tail = res.stderr_tail.decode("utf-8", "replace")[-800:].strip()
+        # ffmpeg_argv pins -loglevel error, so any stderr line is error-level
+        # evidence: some builds (6.1.x) exit rc=0 after decoder errors.
+        tail = res.stderr_tail.decode("utf-8", "replace").strip()[-800:]
+        if res.timed_out or res.returncode != 0 or tail:
             return _fail(ArtifactProcessError(f"ffmpeg exited rc={res.returncode}: {tail}"))
         if not tmp_out.exists():
             return _fail(ArtifactProcessError("ffmpeg exited 0 but no artifact was produced"))
