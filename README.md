@@ -134,3 +134,23 @@ uv run vibecut render-sequence ./proj sequence.json final.mp4
 默认动态渲染实际生成小型 H.264，分别尝试 NVDEC 解码和 NVENC 编码，记录探测结果及最终 decode/projection/encode 后端。不可用则用 CPU；实际 GPU 作业初始化失败也以**同一裁切和路径**重新 CPU 渲染。v360 始终 CPU；事件记录小样 CPU v360 时间、完整渲染时间与 EOF 解码时间，它们不是 4K 性能承诺。CPU-only CI 不要求显卡。
 
 提交前必须同时通过媒体尺寸/像素格式/帧率/色彩/旋转/轨道检查及全部流 EOF 解码。取消、坏源、缺滤镜、写失败或解码错误均无 succeeded、有效新缓存或部分成片。错误级 stderr 即使 FFmpeg 返回 0 也按失败处理。测试只使用合成方位标记、视频阶跃、音频标记和 10bit SDR 数值斜坡。
+
+
+## 本机 AI 候选分析（任务 #5）
+
+可选 `analyze` 入口只连接显式配置的回环 HTTP 服务，不需要 SDK；模型不可用时保留人工可审阅候选并报告具体阶段，不把规则结果标为 AI 成功。先自行在 LM Studio 启动已安装的视觉模型和本地服务；不会下载模型、修改全局配置或回退云端。
+
+```powershell
+.venv/Scripts/python.exe -m vibecut.cli init ./project
+.venv/Scripts/python.exe -m vibecut.cli analyze ./project ./canonical.mp4 --projection equirect --focus "人物优先，剪出20秒，排除模糊" --endpoint http://127.0.0.1:1234 --model qwen3.8-27b@q4_k_xl --out ./analysis.json
+# --json 同时在 stdout 输出结果；--scenery-priority / --person-priority 可显式指定偏好。
+# 已选模型尚未加载时，只有显式 --allow-jit-load 才允许首个推理触发加载。
+```
+
+默认全片 12 个均匀时刻，每个时刻 14 张重叠视图（6 个赤道方向及上下各 4 个极区方向），768×432 JPEG；通常为 24 次观察 + 1 次选片。默认推理硬预算 32 次（含每批至多一次修复），每次至多 8 图、6,000,000 输入字节、2,048 输出 token，单请求总截止时间 300 s；全部模型请求累计预算 900 s，含至多两次只读模型探测。请求数、探测数、修复数、finish_reason、token 预算、输入大小、耗时和有效采样数写入计量。`--samples`、`--max-requests`、`--timeout` 可调整 CLI 预算；预算较小时把可负担采样重新均布全片，为选择保留请求余量，而不是只看前段。达到限制输出有诊断的 partial 结果，不无限重试。
+
+观察缓存与重点无关，改重点/目标时长仅重算选片；源内容、规范资产、工具、采样视图、模型、推理参数和 schema/prompt 版本参与相应缓存身份。结果中的候选、观察和证据保留 source/time/view ID；选片只能引用窗口内实际观察。AI 草稿不覆盖工程、人工锁定选择或既有结果文件；`to_edit_plan` 生成 derived 相机路径，导出前仍需用户确认。一个工程从探测到结果提交一直持独占作业锁，提交前复核 revision。
+
+离线诊断先运行 `tests/test_analysis_transport.py`、`tests/test_analysis_model.py` 和 `tests/test_analysis_service.py`：这些只使用回环假服务与合成素材，不证明真实模型语义准确。未启动/未加载/无视觉能力、结构化输出失败、超时、OOM、取消都有 stage/code；断网运行需已就绪的本地模型。提示和 JPEG 仅发往配置的回环服务，禁止外部重定向；计量不记录提示、图像或模型思维文本。结果 JSON 本身含用户重点与内容描述，应由用户保存在本机。
+
+语义验收 AC2 尚未放行：需先在本机准备至少 3 段源片，冻结至少 12 个候选窗口的人工标签（source_id、准确起止时间、view_id、人物/风景相关性、不确定项），再分别运行人物优先/风景优先并核对两组相关率是否各 ≥80%，同时记录差异、漏检和不确定项。不得根据模型结果反写标签，也不上传用户视频；缺少这组人工数据时只能报告能力与合同测试证据。
