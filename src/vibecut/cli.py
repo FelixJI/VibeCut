@@ -74,6 +74,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--unique-suffix", action="store_true",
                           help="on output collision create output-N.mp4 instead of failing")
     p_export.add_argument("--timeout", type=float, default=600.0, help="render timeout seconds")
+    p_sequence = sub.add_parser("render-sequence", help="render a bound dynamic sequence JSON")
+    p_sequence.add_argument("project", type=Path)
+    p_sequence.add_argument("sequence", type=Path)
+    p_sequence.add_argument("output", type=Path)
+    p_sequence.add_argument("--preview", action="store_true", help="same evaluator, 640x360 / 360x640")
+    p_sequence.add_argument("--cpu", action="store_true", help="disable actual NVDEC/NVENC probes")
+    p_sequence.add_argument("--unique-suffix", action="store_true")
+    p_sequence.add_argument("--timeout", type=float, default=600.0)
     return parser
 
 
@@ -236,6 +244,49 @@ def _export_locked(args, project, tools) -> int:
         on_exists="unique" if args.unique_suffix else "fail",
         cache=cache, cancel_event=cancel_event, job_id=job_id,
     )
+    return _record_result(project, result, job_id)
+
+
+def _cmd_sequence(args):
+    import vibecut.core.jobs as jobs
+    from vibecut.core.cache import Cache
+    from vibecut.core.sequence import SequencePlan
+    from vibecut.render.dynamic import render_sequence
+    from vibecut.render.static import StaticRenderConfig
+
+    tools = _resolve_tools()
+    if tools is None:
+        return EXIT_TOOLS
+    project = _load_project(args.project)
+    with project.exclusive_lock(timeout_s=0):
+        project.check_revision()
+        try:
+            plan = SequencePlan.from_json(json.loads(args.sequence.read_text(encoding="utf-8")))
+        except (KeyError, TypeError, OverflowError) as exc:
+            raise ValueError(f"invalid sequence JSON: {exc}") from exc
+        plan.validate_sources(project.sources)
+        job_id = jobs.new_job_id()
+        project.sequences[job_id] = plan
+        project.save()
+        for status in ("queued", "running"):
+            project.add_job_event(jobs.make_event(job_id, project.revision, status))
+        width, height = (640, 360) if args.preview else (1920, 1080)
+        if plan.aspect == "9:16":
+            width, height = height, width
+        config = StaticRenderConfig(out_width=width, out_height=height, crf=26 if args.preview else 18,
+                                    timeout_s=args.timeout, backend="cpu" if args.cpu else "auto", preview=args.preview)
+        result = render_sequence(plan, project.sources, tools, args.output, config,
+                                 on_exists="unique" if args.unique_suffix else "fail",
+                                 cache=Cache(project.path.parent / ".vibecut-cache"), job_id=job_id)
+        for status, note in result.events:
+            print(f"{status}: {note}")
+        return _record_result(project, result, job_id)
+
+
+def _record_result(project, result, job_id):
+    import vibecut.core.jobs as jobs
+    from vibecut.core.project import ProjectError, StaleRevisionError
+
     try:
         if result.status == "succeeded":
             project.add_job_event(jobs.make_event(
@@ -281,6 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "inspect": _cmd_inspect,
         "add-source": _cmd_add_source,
         "export": _cmd_export,
+        "render-sequence": _cmd_sequence,
     }
     try:
         return handlers[args.command](args)

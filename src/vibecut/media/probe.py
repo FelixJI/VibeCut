@@ -1,7 +1,7 @@
 """Source probing (MediaSource construction) and artifact validation.
 
 Fail-fast rules (invariants, per task #2 contract correction):
-  * colour: ONLY explicitly tagged BT.709 / tv-range / 8-bit SDR is accepted.
+  * colour: ONLY explicitly tagged BT.709 / tv-range / 8/10-bit SDR is accepted.
     unknown/untagged or non-709 values are rejected - VibeCut never silently
     relabels colour it did not actually convert;
   * frame timing: CFR is verified from the REAL frame packet PTS on the wire
@@ -76,7 +76,7 @@ def content_fingerprint(path: Path, *, chunk: int = 1 << 20) -> str:
 def _ffprobe_json(tools: FFmpegTools, path: Path, argv_extra: list[str], *, timeout_s: float = PROBE_TIMEOUT_S) -> dict[str, Any]:
     argv = tools.ffprobe_argv("-print_format", "json", *argv_extra, "-i", str(path))
     res = tools.run(argv, timeout_s=timeout_s)
-    if res.returncode != 0:
+    if res.returncode != 0 or res.timed_out or res.cancelled or res.stderr_tail.strip():
         tail = res.stderr_tail.decode("utf-8", "replace")[-500:].strip()
         raise ProbeError(f"ffprobe failed for {path.name} (rc={res.returncode}): {tail}")
     try:
@@ -261,14 +261,14 @@ def _check_color(vs: dict[str, Any]) -> ColorContract:
         problems.append(f"matrix {color.matrix or 'unknown/untagged'!r}")
     if color.range not in ("tv", "mpeg"):
         problems.append(f"range {color.range or 'unknown/untagged'!r} (only limited/tv is converted honestly; full/pc would need real range conversion)")
-    if color.bit_depth != 8:
-        problems.append(f"bit depth {color.bit_depth} (only 8-bit SDR is supported)")
+    if color.bit_depth not in (8, 10):
+        problems.append(f"bit depth {color.bit_depth} (only 8/10-bit SDR is supported)")
     if problems:
         raise UnsupportedSourceError(
-            "source colour contract is not tagged BT.709/tv/8-bit SDR: " + "; ".join(problems)
+            "source colour contract is not tagged BT.709/tv/8/10-bit SDR: " + "; ".join(problems)
             + ". VibeCut does not silently relabel colour it did not convert; establish the input colour space and perform a real BT.709 SDR conversion first."
         )
-    return ColorContract("bt709", "bt709", "bt709", "tv", 8)
+    return color
 
 
 def probe_source(
@@ -442,11 +442,15 @@ def validate_output(
         raise ArtifactValidationError(f"resolution {v['width']}x{v['height']} != {expected_width}x{expected_height}")
     if str(v.get("codec_name")) != "h264":
         raise ArtifactValidationError(f"video codec {v.get('codec_name')!r} != h264")
+    if v.get("pix_fmt") != "yuv420p":
+        raise ArtifactValidationError(f"output pixel format {v.get('pix_fmt')!r} != yuv420p")
+    if any(int(sd.get("rotation", 0)) != 0 for sd in v.get("side_data_list", [])) or int(v.get("tags", {}).get("rotate", 0)) != 0:
+        raise ArtifactValidationError("output carries nonzero display rotation")
     out_fps = parse_frac(v.get("avg_frame_rate") or "0", name="out fps")
     if out_fps != expected_fps:
         raise ArtifactValidationError(f"output fps {v.get('avg_frame_rate')} != {expected_fps}")
     if expect_audio:
-        if not audio:
+        if len(audio) != 1:
             raise ArtifactValidationError("audio stream missing but was expected")
         if str(audio[0].get("codec_name")) != "aac":
             raise ArtifactValidationError(f"audio codec {audio[0].get('codec_name')!r} != aac")

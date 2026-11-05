@@ -21,6 +21,7 @@ from vibecut.core.contracts import (  # noqa: E402
     TimeMap,
 )
 from vibecut.core.project import (  # noqa: E402
+    PROJECT_SCHEMA_VERSION,
     Project,
     ProjectFormatError,
     ProjectLockedError,
@@ -40,6 +41,34 @@ def test_create_load_roundtrip(tmp_path):
     assert loaded.project_id == p.project_id
     assert loaded.revision == 1  # creation save persists revision 1
     assert loaded.fps == Fraction(30000, 1001)
+
+
+def test_schema_v1_loads_and_saves_as_v2_without_losing_static_plans(tmp_path):
+    p = make_project(tmp_path)
+    p.plans["static"] = _make_plan()
+    raw = p.to_payload()
+    raw["project_schema_version"] = 1
+    del raw["sequences"]  # actual pre-sequence project shape
+    p.path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = Project.load(p.path)
+    assert loaded.plans["static"] == p.plans["static"]
+    assert loaded.sequences == {}
+    loaded.save()
+    saved = json.loads(p.path.read_text(encoding="utf-8"))
+    assert saved["project_schema_version"] == 2  # schema1 readers reject instead of dropping sequences
+    assert saved["plans"]["static"] == raw["plans"]["static"]
+    assert Project.load(p.path).plans["static"] == p.plans["static"]
+
+
+def test_unknown_project_schema_rejected_without_rewriting(tmp_path):
+    p = make_project(tmp_path)
+    raw = p.to_payload()
+    raw["project_schema_version"] = 3
+    p.path.write_text(json.dumps(raw), encoding="utf-8")
+    before = p.path.read_bytes()
+    with pytest.raises(ProjectFormatError, match="unsupported project schema"):
+        Project.load(p.path)
+    assert p.path.read_bytes() == before
 
 
 def test_save_increments_revision_and_is_atomic(tmp_path):
@@ -66,7 +95,7 @@ def test_interrupted_save_leaves_last_complete_version(tmp_path):
         import json, os, sys
         from pathlib import Path
         sys.path.insert(0, r"{Path(__file__).resolve().parents[1] / 'src'}")
-        from vibecut.core.project import Project
+        from vibecut.core.project import Project, PROJECT_SCHEMA_VERSION
         proj = Project.load(r"{p.path}")
 
         def boom(src, dst):
@@ -74,7 +103,7 @@ def test_interrupted_save_leaves_last_complete_version(tmp_path):
             data = Path(src).read_text(encoding="utf-8")
             payload = json.loads(data)  # must parse end-to-end: no torn write
             assert payload["revision"] == 2, payload["revision"]
-            assert payload["project_schema_version"] == 1
+            assert payload["project_schema_version"] == PROJECT_SCHEMA_VERSION
             assert payload["contract_schema_version"] == 2
             assert Path(src).parent == Path(dst).parent  # same-directory tmp
             print("TEMP_VERIFIED revision=%d bytes=%d" % (payload["revision"], len(data)), flush=True)
@@ -100,7 +129,7 @@ def test_interrupted_save_leaves_last_complete_version(tmp_path):
     assert len(leftovers) == 1
     crashed = json.loads(leftovers[0].read_text(encoding="utf-8"))
     assert crashed["revision"] == 2
-    assert crashed["project_schema_version"] == 1
+    assert crashed["project_schema_version"] == PROJECT_SCHEMA_VERSION
 
 
 def test_load_rejects_unknown_root_contract_schema_version(tmp_path):

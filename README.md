@@ -1,7 +1,7 @@
 # VibeCut
 
-VibeCut 把单目 equirectangular（360° 全景）SDR MP4 剪成**固定视角的普通平面视频**。
-本仓库是任务 #2 的最小完整静态流水线：探测 → 工程 → 固定视角导出 1920×1080 H.264/AAC/BT.709，
+VibeCut 把单目 equirectangular（360° 全景）SDR MP4 剪成**普通平面视频**。
+支持固定视角和动态虚拟相机：探测 → 工程 → 路径/多源顺序剪辑 → 1080p H.264/AAC/BT.709，
 不依赖任何 SDK、模型、GPU、Qt 或网络服务，核心包只用 Python 标准库。
 
 ## 快速开始
@@ -11,7 +11,7 @@ VibeCut 把单目 equirectangular（360° 全景）SDR MP4 剪成**固定视角�
 #   VIBECUT_FFMPEG=C:\tools\ffmpeg\bin\ffmpeg.exe
 #   VIBECUT_FFPROBE=C:\tools\ffmpeg\bin\ffprobe.exe
 uv sync --frozen             # 安装锁定环境（运行时零第三方依赖，dev 组为 pytest）
-uv run vibecut init ./proj   # 建工程（vibecut.project.json, project schema v1, revision 1）
+uv run vibecut init ./proj   # 建工程（vibecut.project.json, project schema v2, revision 1）
 uv run vibecut inspect 输入.mp4 --projection equirect   # 打印 MediaSource 合同
 uv run vibecut add-source ./proj 输入.mp4 --projection equirect
 uv run vibecut export ./proj 输入.mp4 成片.mp4 --projection equirect --yaw 90 --pitch 0 --hfov 90
@@ -29,7 +29,7 @@ uv run vibecut export ./proj 输入.mp4 成片.mp4 --projection equirect --yaw 9
 
 ## 版本化合同对象（`vibecut.core.contracts`，schema **v2**，随本 PR 冻结）
 
-`MediaSource`（稳定 `source_id` = 内容指纹前缀、路径、投影、**稳定化 provenance（v2 新增，#2 仅允许 "none"）**、色彩 primaries/transfer/matrix/range/bit depth（仅接受显式 bt709/tv/8bit）、start PTS/time_base/fps 有理数、音频流、VFR 标记）、`NormalizedAsset`（规范资产/代理 + `TimeMap` 时间映射 + 稳定化 provenance）、`EditPlan`（source-relative 入出点 + **manual cut 锁定标志**（v2）、工程帧率、`CameraPath`）、`CameraPath`（v2 新增 **provenance="user"/"derived"**：手工锁定值永远优先于自动推导；静态导出仅接受 "user"）、`JobEvent`（job_id + project_revision）。
+`MediaSource`（稳定 `source_id` = 内容指纹前缀、路径、投影、稳定化 provenance（仅允许 "none"）、色彩 primaries/transfer/matrix/range/bit depth（显式 bt709/tv/8bit 或 10bit SDR）、start PTS/time_base/fps 有理数、音频流、VFR 标记）、`NormalizedAsset`（规范资产/代理 + `TimeMap` 时间映射 + 稳定化 provenance）、`EditPlan`（source-relative 入出点 + manual cut 锁定标志、工程帧率、`CameraPath`）、`CameraPath`（provenance="user"/"derived"：手工锁定值优先；渲染仅接受 "user"）、`JobEvent`（job_id + project_revision）。
 
 帧时序验证（v2 纠偏）：CFR 由视频流真实包 PTS 的均匀间隔验证；`r_frame_rate==avg_frame_rate` 不再作为充分条件（存在同均值真 VFR 夹具回归），PTS 非均匀或与 avg 帧率矛盾均拒绝；首个显示帧 PTS 取自实际包，不盲信 `stream.start_pts`。投影检测（v2 纠偏）仅信任结构化标记（流 side_data `projection` / `ProjectionType` 标签）或显式声明；自由文本/文件名永不参与，立体布局与矛盾标记直接拒绝。
 
@@ -54,7 +54,7 @@ uv run vibecut export ./proj 输入.mp4 成片.mp4 --projection equirect --yaw 9
 
 ## 支持范围（MVP 边界）
 
-- 仅单目 equirect **显式标记 BT.709 / tv-range / 8bit SDR** 的 MP4/MOV，H.264/HEVC：未知/未标记色彩、非 bt709、全范围（pc/jpeg）、10bit、HDR 一律提前拒绝——绝不做未经真实转换的色彩重标；真 VFR、非 2:1、未知投影（未声明）、立体/双鱼眼标记、矛盾元数据、多视频流、不可剪音轨同样提前可识别地拒绝。CFR 由真实帧包 PTS 均匀性验证（而非 r/avg 帧率字段），首个显示帧 PTS 取自实际包。
+- 仅单目 equirect **显式标记 BT.709 / tv-range / 8bit 或 10bit SDR** 的 MP4/MOV，H.264/HEVC；10bit 在 FFmpeg 像素处理中真实转换为 yuv420p 8bit，代理合同同样记录实际 8bit。未知/未标记色彩、非 bt709、全范围（pc/jpeg）、12/16bit、HDR/HLG/PQ/Log/Dolby 一律提前拒绝；真 VFR、非 2:1、未知投影（未声明）、立体/双鱼眼标记、矛盾元数据、多视频流、不可剪音轨同样提前拒绝。
 - 无音频不失败（输出无音轨）；有音频转 AAC 192k，输出移除全部 spherical metadata 并带 faststart。
 - 源与既有成片**永不覆盖**：目标冲突失败（`--unique-suffix` 另建唯一输出）。
 
@@ -72,7 +72,7 @@ CI（`.github/workflows/ci.yml`）：从 Ubuntu 官方软件包安装 ffmpeg 并
 ```
 src/vibecut/core/     contracts(合同)/geometry(几何)/project(工程)/jobs/cache/proc(进程)
 src/vibecut/media/    ffmpeg(工具发现)/probe(探测+产物验证)/proxy(规范代理)
-src/vibecut/render/   static(静态导出流水线)
+src/vibecut/render/   static(唯一产物事务)/dynamic(动态相机与序列图)
 src/vibecut/cli.py    headless CLI（惰性导入，核心无 ffmpeg 依赖）
 tests/                纯核心测试 + ffmpeg 合成媒体测试
 ```
@@ -95,3 +95,42 @@ $env:VIBECUT_REQUIRE_FFMPEG = "1"
 ```
 
 Windows 产物提交需要目标文件系统支持硬链接且运行环境允许创建硬链接；不满足时明确失败并保留现有文件。受限 AppContainer 可拒绝这一操作；本机媒体验收使用正常 NTFS 进程权限。
+
+## 动态相机与多源剪辑（任务 #4）
+
+旧 `CameraPath` / `EditPlan` schema v2、静态 API 和旧 schema1 工程保持可读。工程保存升级为 project schema2，使旧读取器明确拒绝，而非忽略并丢失 `sequences`；contract schema 仍为 v2。`core.sequence` 独立提供 schema v1：
+`BoundCameraPath(asset_id, aspect, camera, cuts, geometry_revision=1)`、`SequenceClip(source_id, cut_in_rel, cut_out_rel, path)` 和 `SequencePlan(clips, project_fps, aspect, audio=True)`。
+这里 asset_id 绑定已探测原素材的 source_id（其内容身份已由 #2 指纹合同验证），geometry revision 1 固定绝对 Ry(yaw) Rx(pitch) Rz(roll) 世界参考。
+
+路径键时间仍是源首显示帧起算的 Fraction。路径须覆盖完整片段且所有键位于实际源范围内；键时间严格递增、数值有限、pitch 在 ±90°、水平 FOV 在 (0,180)。yaw 和 roll 沿最短圆弧线性插值；pitch/FOV 线性插值。`cuts` 必须命名非首个现有键；切点之前保持上一键，切点处立即采用新键。片段边界本身也是硬切。每段时长必须是整数个输出帧，避免多段舍入累积；不同源帧率由实际 PTS 校验后的源统一到 project_fps。
+
+横屏路径必须绑定 `16:9`，竖屏路径必须另建并绑定 `9:16`。默认最终尺寸分别为 1920×1080 和 1080×1920；预览分别为 640×360 和 360×640。预览/最终共用同一评估器、绝对源时间、v360 投影与每帧运行时命令（`reset_rot=1,rorder=ypr`）；只降低分辨率和编码质量。每帧命令在 PTS 归零及 fps 统一之后应用。
+
+在工程导入素材后，可以用标准库 API 写入可检查的序列 JSON：
+
+```python
+import json
+from fractions import Fraction as F
+from pathlib import Path
+from vibecut.core import CONTRACT_VERSION, CameraPath, CameraView, BoundCameraPath, SequenceClip, SequencePlan
+from vibecut.core.project import Project
+
+project = Project.load(Path("proj/vibecut.project.json"))
+source = next(iter(project.sources.values()))
+camera = CameraPath(CONTRACT_VERSION, ((F(0), CameraView(178)), (F(1), CameraView(-178))))
+path = BoundCameraPath(source.source_id, "16:9", camera)
+plan = SequencePlan((SequenceClip(source.source_id, F(0), F(1), path),), F(30))
+Path("sequence.json").write_text(json.dumps(plan.to_json(), indent=2), encoding="utf-8")
+```
+
+```bash
+uv run vibecut render-sequence ./proj sequence.json preview.mp4 --preview
+uv run vibecut render-sequence ./proj sequence.json final.mp4
+# --cpu 禁用 GPU 探测；--unique-suffix 保留既有输出并另取名字
+```
+
+序列随 job_id 写入工程可选 `sequences` 字段，持同一项目锁至验证/保存结束。所有来源按同一绝对 PTS 窗口裁切音画；音频统一 48kHz stereo AAC，无音轨的片段补静音，`audio=False` 明确输出无音轨。预览缓存包含不可变 payload，以源内容、工具 build、路径、cut、画幅、质量和色彩入键，命中后仍经 probe 与全部轨道解码验证，最后无覆盖提交；工程 revision 不入键。
+
+默认动态渲染实际生成小型 H.264，分别尝试 NVDEC 解码和 NVENC 编码，记录探测结果及最终 decode/projection/encode 后端。不可用则用 CPU；实际 GPU 作业初始化失败也以**同一裁切和路径**重新 CPU 渲染。v360 始终 CPU；事件记录小样 CPU v360 时间、完整渲染时间与 EOF 解码时间，它们不是 4K 性能承诺。CPU-only CI 不要求显卡。
+
+提交前必须同时通过媒体尺寸/像素格式/帧率/色彩/旋转/轨道检查及全部流 EOF 解码。取消、坏源、缺滤镜、写失败或解码错误均无 succeeded、有效新缓存或部分成片。错误级 stderr 即使 FFmpeg 返回 0 也按失败处理。测试只使用合成方位标记、视频阶跃、音频标记和 10bit SDR 数值斜坡。

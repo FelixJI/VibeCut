@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from vibecut.core.cache import Cache, normalized_key
-from vibecut.core.contracts import CONTRACT_VERSION, MediaSource, NormalizedAsset, TimeMap
+from vibecut.core.contracts import CONTRACT_VERSION, ColorContract, MediaSource, NormalizedAsset, TimeMap
 from vibecut.media.ffmpeg import FFmpegTools
 from vibecut.media.probe import content_fingerprint, validate_output
 
@@ -36,7 +36,7 @@ def _proxy_key(source: MediaSource, tools: FFmpegTools, width: int, height: int)
         tool_identity=tools.identity(),
         kind="proxy",
         color=source.color.to_json(),
-        config={"pipeline": "proxy-v4-error-level-stderr", "width": width, "height": height, "scale": "bicubic",
+        config={"pipeline": "proxy-v5-sdr8-output", "width": width, "height": height, "scale": "bicubic",
                 "video": "libx264-crf23", "space": "canonical-equirect-mono",
                 "stabilization_provenance": source.stabilization_provenance},
     )
@@ -86,7 +86,7 @@ def ensure_proxy(
             schema_version=CONTRACT_VERSION, asset_id=f"v1:{key[:16]}",
             kind="proxy", source_id=source.source_id, path=str(payload),
             time_map=TimeMap(asset_start_source_rel=Fraction(0), fps=source.video.fps),
-            color=source.color, stabilization_provenance=source.stabilization_provenance,
+            color=ColorContract("bt709", "bt709", "bt709", "tv", 8), stabilization_provenance=source.stabilization_provenance,
         )
 
     check_source()
@@ -122,7 +122,7 @@ def ensure_proxy(
         payload = cache.put_atomic(
             key,
             meta={"kind": "proxy", "source_id": source.source_id,
-                  "width": width, "height": height, "color": source.color.to_json()},
+                  "width": width, "height": height, "color": ColorContract("bt709", "bt709", "bt709", "tv", 8).to_json()},
             payload_writer=lambda target: shutil.copyfile(tmp, target),
             validator=validate,
         )

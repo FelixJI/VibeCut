@@ -13,6 +13,7 @@ from vibecut.render.static import (
     StaticRenderConfig,
     render_static,
 )
+from vibecut.render.dynamic import render_sequence
 
 __all__ = [
     "ArtifactProcessError",
@@ -22,4 +23,5 @@ __all__ = [
     "SourceChangedError",
     "StaticRenderConfig",
     "render_static",
+    "render_sequence",
 ]

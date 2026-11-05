@@ -89,9 +89,9 @@ def v360_args(view: CameraView, out_width: int, out_height: int) -> dict[str, st
         "output": "flat",
         "w": str(out_width),
         "h": str(out_height),
-        "yaw": f"{view.yaw_deg:.6f}",
+        "yaw": f"{wrap_yaw(view.yaw_deg):.6f}",
         "pitch": f"{view.pitch_deg:.6f}",
-        "roll": f"{view.roll_deg:.6f}",
+        "roll": f"{wrap_yaw(view.roll_deg):.6f}",
         "h_fov": f"{view.h_fov_deg:.6f}",
         "v_fov": f"{vfov_from_hfov(view.h_fov_deg, out_width, out_height):.6f}",
     }

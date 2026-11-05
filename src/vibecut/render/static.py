@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 import threading
+import tempfile
+import shutil
 import uuid
 from dataclasses import dataclass
 from fractions import Fraction
@@ -26,6 +28,7 @@ from typing import Any, Optional
 
 from vibecut.core.cache import Cache, normalized_key, render_key
 from vibecut.core.contracts import EditPlan, MediaSource
+from vibecut.core.sequence import SequencePlan
 from vibecut.core.geometry import v360_filter
 from vibecut.core.proc import run_bounded
 from vibecut.media.ffmpeg import FFmpegTools
@@ -57,6 +60,8 @@ class StaticRenderConfig:
     preset: str = "veryfast"
     audio_bitrate: str = "192k"
     timeout_s: float = 600.0
+    backend: str = "cpu"  # dynamic: cpu | auto (actual NVDEC/NVENC probes)
+    preview: bool = False
     # Render-configuration identity used for cache keys (NOT edit revision):
     def identity(self) -> dict[str, Any]:
         return {
@@ -67,6 +72,8 @@ class StaticRenderConfig:
             "crf": self.crf,
             "preset": self.preset,
             "audio_bitrate": self.audio_bitrate,
+            "backend": self.backend,
+            "preview": self.preview,
         }
 
 
@@ -181,12 +188,14 @@ def build_ffmpeg_argv(
     return tuple(args)
 
 
-def render_config_identity(config: StaticRenderConfig, plan: EditPlan) -> dict[str, Any]:
+def render_config_identity(config: StaticRenderConfig, plan: EditPlan | SequencePlan) -> dict[str, Any]:
     """Cache identity of a render: config + plan content that shapes the output.
 
     Deliberately contains no project/edit revision and no manual-lock flags -
     bumping a revision never invalidates caches.
     """
+    if isinstance(plan, SequencePlan):
+        return {**config.identity(), "pipeline": "sequence-v1", "sequence": plan.to_json()}
     return {
         **config.identity(),
         "cut_in_rel": str(plan.cut_in_rel),
@@ -198,8 +207,8 @@ def render_config_identity(config: StaticRenderConfig, plan: EditPlan) -> dict[s
 
 
 def render_static(
-    plan: EditPlan,
-    source: MediaSource,
+    plan: EditPlan | SequencePlan,
+    source: MediaSource | dict[str, MediaSource],
     tools: FFmpegTools,
     out_path: Path,
     config: StaticRenderConfig = StaticRenderConfig(),
@@ -212,27 +221,50 @@ def render_static(
     """Run the full static export; see module docstring for ordering."""
     job_id = job_id or uuid.uuid4().hex
     events: list[tuple[str, str]] = []
+    cache_key = None
+    cache_hit = False
 
     def _fail(err: Exception, status: str = "failed") -> RenderResult:
+        if cancel_event is not None and cancel_event.is_set():
+            status = "cancelled"
+        if status == "failed" and cache_hit and cache is not None and cache_key is not None:
+            try:
+                cache.invalidate(cache_key)
+            except OSError:
+                pass
         events.append((status, str(err)))
         return RenderResult(job_id=job_id, status=status, error=f"{type(err).__name__}: {err}", events=tuple(events))
 
-    if plan.source_id != source.source_id:
+    dynamic = isinstance(plan, SequencePlan)
+    if cancel_event is not None and cancel_event.is_set():
+        return _fail(ExportError("cancelled before render"), "cancelled")
+    sources = source if dynamic else {source.source_id: source}
+    if dynamic:
+        try:
+            plan.validate_sources(sources)
+            if config.out_width * (9 if plan.aspect == "16:9" else 16) != config.out_height * (16 if plan.aspect == "16:9" else 9):
+                raise ExportError("output dimensions disagree with bound path aspect")
+            if config.backend not in ("auto", "cpu"):
+                raise ExportError("backend must be auto or cpu")
+            sources = {c.source_id: sources[c.source_id] for c in plan.clips}
+        except Exception as exc:
+            return _fail(exc)
+    if not dynamic and plan.source_id != source.source_id:
         return _fail(ExportError(f"plan is for source {plan.source_id}, got {source.source_id}"))
-    if plan.camera.provenance != "user":
+    if not dynamic and plan.camera.provenance != "user":
         return _fail(ExportError("static render requires explicit manual ('user') camera locks"))
 
     # 1. source immutability (pre) - also the anchor for cache identity
     try:
-        current_fp = content_fingerprint(Path(source.path))
+        for item in sources.values():
+            if content_fingerprint(Path(item.path)) != item.content_fingerprint:
+                raise SourceChangedError(f"source content changed on disk since ingest: {item.path}")
+    except SourceChangedError as exc:
+        return _fail(exc)
     except OSError as exc:
         return _fail(ExportError(f"source unreadable: {exc}"))
-    if current_fp != source.content_fingerprint:
-        return _fail(SourceChangedError(f"source content changed on disk since ingest: {source.path}"))
-
     out_path = Path(out_path).resolve()
-    src_path = Path(source.path).resolve()
-    if out_path == src_path or out_path.name == src_path.name and out_path.parent == src_path.parent:
+    if any(out_path == Path(item.path).resolve() for item in sources.values()):
         return _fail(OutputExistsError("output path must differ from the source path"))
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,24 +286,50 @@ def render_static(
         os.close(fd)
     except OSError as exc:
         return _fail(ExportError(f"cannot exclusively create temp artifact: {exc}"))
+    command_dir = None
     try:
-        argv = tools.ffmpeg_argv(*build_ffmpeg_argv(source, plan, config, tmp_out))
+        nvdec = nvenc = False
+        if dynamic:
+            from vibecut.render.dynamic import build_sequence_argv, probe_backends
+            command_dir = tempfile.TemporaryDirectory(prefix=".vibecut-camera-", dir=out_path.parent)
+            if config.backend == "auto":
+                nvdec, nvenc, backend_events = probe_backends(tools, Path(command_dir.name), config.timeout_s, cancel_event)
+                events.extend(backend_events)
+            events.append(("backend", f"decode={'nvdec' if nvdec else 'cpu'} projection=cpu-v360 encode={'nvenc' if nvenc else 'libx264'}"))
+            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name), nvdec=nvdec, nvenc=nvenc, cancel_event=cancel_event))
+        else:
+            argv = tools.ffmpeg_argv(*build_ffmpeg_argv(source, plan, config, tmp_out))
 
         # cache key: source content + tool + render config + colour contract (never edit revision)
         cache_key: Optional[str] = None
         if cache is not None:
-            nkey = normalized_key(
-                source_fingerprint=source.content_fingerprint,
-                source_projection=source.projection,
+            nkeys = [normalized_key(
+                source_fingerprint=item.content_fingerprint,
+                source_projection=item.projection,
                 tool_identity=tools.identity(),
                 kind="none",
-                config={"space": "canonical-equirect-mono", "stabilization_provenance": source.stabilization_provenance},
-                color=source.color.to_json(),
-            )
-            cache_key = render_key(normalized=nkey, config_identity=render_config_identity(config, plan))
+                config={"space": "canonical-equirect-mono", "stabilization_provenance": item.stabilization_provenance},
+                color=item.color.to_json(),
+            ) for item in sources.values()]
+            cache_key = render_key(normalized="|".join(nkeys), config_identity=render_config_identity(config, plan))
+            if dynamic and config.preview:
+                hit = cache.get(cache_key)
+                if hit is not None and hit[1] is not None:
+                    # Remux an immutable cached preview through the same bounded/validated transaction.
+                    argv = tools.ffmpeg_argv("-xerror", "-i", str(hit[1]), "-map", "0", "-c", "copy",
+                                             "-map_metadata", "-1", "-f", "mp4", "-y", str(tmp_out))
+                    nvdec = nvenc = False
+                    cache_hit = True
+                    events.append(("cache-hit", cache_key))
+                    events.append(("backend", "cached-preview remux=cpu-copy; no projection/encoding"))
 
         # 3-4. run and wait for the REAL process exit
         res = tools.run(argv, timeout_s=config.timeout_s, cancel_event=cancel_event)
+        if dynamic and (nvdec or nvenc) and not res.cancelled and not res.timed_out and (res.returncode != 0 or res.stderr_tail.strip()):
+            events.append(("cpu-fallback", res.stderr_tail.decode("utf-8", "replace")[:1200]))
+            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name), cancel_event=cancel_event))
+            res = tools.run(argv, timeout_s=config.timeout_s, cancel_event=cancel_event)
+            events.append(("backend", "decode=cpu projection=cpu-v360 encode=libx264"))
         if res.cancelled:
             events.append(("cancelled", f"duration={res.duration_s:.2f}s"))
             return RenderResult(job_id=job_id, status="cancelled", cache_key=cache_key, events=tuple(events))
@@ -298,17 +356,29 @@ def render_static(
                 expected_height=config.out_height,
                 expected_fps=plan.project_fps,
                 expected_duration_s=float(plan.duration_rel),
-                expect_audio=plan.audio and source.audio is not None,
+                expect_audio=plan.audio if dynamic else plan.audio and source.audio is not None,
             )
         except ArtifactValidationError as exc:
+            if dynamic and config.preview and cache is not None and cache_key is not None:
+                cache.invalidate(cache_key)
             return _fail(exc)
         except Exception as exc:  # probe infrastructure failure - still a clean abort
             return _fail(ExportError(f"validation did not run cleanly: {exc}"))
         events.append(("validated", "probe contract ok"))
 
+        decoded = tools.run(tools.ffmpeg_argv("-xerror", "-err_detect", "explode", "-i", str(tmp_out),
+                                             "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"),
+                            timeout_s=config.timeout_s, cancel_event=cancel_event)
+        if decoded.cancelled:
+            return _fail(ExportError("cancelled during complete output decode"), "cancelled")
+        if decoded.returncode != 0 or decoded.timed_out or decoded.stderr_tail.strip():
+            return _fail(ArtifactProcessError("output did not completely decode: " + decoded.stderr_tail.decode("utf-8", "replace")[-800:]))
+        events.append(("decoded", f"all streams to EOF seconds={decoded.duration_s:.4f}"))
+
         # 6. source immutability (post)
-        if content_fingerprint(Path(source.path)) != source.content_fingerprint:
-            return _fail(SourceChangedError(f"source changed during render: {source.path}"))
+        for item in sources.values():
+            if content_fingerprint(Path(item.path)) != item.content_fingerprint:
+                return _fail(SourceChangedError(f"source changed during render: {item.path}"))
 
         # cancellation between validation and commit must not publish success
         if cancel_event is not None and cancel_event.is_set():
@@ -322,12 +392,13 @@ def render_static(
             return _fail(exc)
         events.append(("committed", str(final)))
 
-        # 8. record cache manifest (metadata only - payloads are never duplicated)
-        if cache is not None and cache_key is not None:
+        # 8. Fresh renders publish a cache generation; hits retain the immutable manifest/payload.
+        if cache is not None and cache_key is not None and not cache_hit:
             try:
                 cache.put_atomic(
                     cache_key,
                     meta={"kind": "render-manifest", "artifact": str(final), "job_id": job_id},
+                    payload_writer=(lambda target: shutil.copyfile(final, target)) if dynamic and config.preview else None,
                 )
             except OSError:
                 pass  # cache bookkeeping is best-effort; artifact is already committed
@@ -338,3 +409,5 @@ def render_static(
         return _fail(exc)
     finally:
         tmp_out.unlink(missing_ok=True)
+        if command_dir is not None:
+            command_dir.cleanup()

@@ -25,6 +25,7 @@ from vibecut.core.geometry import (
     vfov_from_hfov,
     wrap_yaw,
 )
+from vibecut.core.sequence import BoundCameraPath, SequenceClip, SequencePlan
 
 __all__ = [
     "CONTRACT_VERSION",
@@ -33,6 +34,9 @@ __all__ = [
     "CameraView",
     "ColorContract",
     "EditPlan",
+    "BoundCameraPath",
+    "SequenceClip",
+    "SequencePlan",
     "JobEvent",
     "MediaSource",
     "NormalizedAsset",
