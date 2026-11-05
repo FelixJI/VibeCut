@@ -61,6 +61,7 @@ class AnalysisConfig:
     max_repair_retries: int = 1
     max_candidates: int = 24
     ffmpeg_timeout_s: float = 300.0
+    selection_max_tokens: int = 4096
     temperature: float = 0.2
     allow_jit_load: bool = False  # explicit opt-in: first chat request may load the model
 
@@ -68,7 +69,7 @@ class AnalysisConfig:
         for name, low, high in (("samples", 1, 64), ("max_model_requests", 0, 1024),
                                 ("max_images_per_request", 1, 8), ("max_request_input_bytes", 1, 64_000_000),
                                 ("max_repair_retries", 0, 1), ("max_candidates", 14, 256),
-                                ("image_width", 16, 4096), ("image_height", 16, 4096)):
+                                ("image_width", 16, 4096), ("image_height", 16, 4096), ("selection_max_tokens", 256, 8192)):
             value = getattr(self, name)
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"{name} must be an integer in {low}..{high}")
@@ -87,6 +88,7 @@ class AnalysisConfig:
             "model_timeout_s": self.model_timeout_s, "total_model_budget_s": self.total_model_budget_s,
             "max_repair_retries": self.max_repair_retries, "max_candidates": self.max_candidates,
             "temperature": self.temperature, "allow_jit_load": self.allow_jit_load,
+            "selection_max_tokens": self.selection_max_tokens,
         }
 
 
@@ -191,7 +193,7 @@ def analyze(
         transport = transport or LoopbackTransport(config.endpoint, request_timeout_s=config.model_timeout_s)
         client = ModelClient(
             transport, config.model_id, metering=metering,
-            request_timeout_s=config.model_timeout_s, temperature=config.temperature,
+            request_timeout_s=config.model_timeout_s, temperature=config.temperature, selection_max_tokens=config.selection_max_tokens,
             max_model_requests=config.max_model_requests, total_model_budget_s=config.total_model_budget_s,
             max_request_input_bytes=config.max_request_input_bytes,
             max_images_per_request=config.max_images_per_request, max_repair_retries=config.max_repair_retries,
@@ -247,6 +249,8 @@ def analyze(
             # rejected-but-observable model items from a failed stage
             diagnostics.append({"stage": "validation", "code": "item-dropped", "message": str(msg)[:200]})
     except OSError as exc:
+        plan = None
+        plan_status = None
         status = "failed"
         diagnostics.append({"stage": "io", "code": "os-error", "message": str(exc)[:200]})
 
@@ -282,7 +286,8 @@ def _cheap_features(source, asset, tools, cache, sampling, config, cancel_event,
     raw, w, h = extract_gray_stream(
         tools, asset.path, fps=fps, cancel_event=cancel_event, timeout_s=config.ffmpeg_timeout_s,
     )
-    features = compute_features(raw, w, h, sampling, fps)
+    # Candidate thresholds must see the same precision as existing persisted caches.
+    features = features_from_json(features_to_json(compute_features(raw, w, h, sampling, fps)))
     cache.put_atomic(key, meta={"kind": "analysis-cheap-features", "schema_version": ANALYSIS_SCHEMA_VERSION,
                                 "features": features_to_json(features)})
     return features
@@ -380,26 +385,25 @@ def _select(source, asset, cache, client, config, focus, candidates, observation
         return {
             "candidate_id": c.candidate_id, "view_id": c.view_id,
             "time_start_s": round(float(c.start_rel), 3), "time_end_s": round(float(c.end_rel), 3),
-            "origin": c.origin, "score": c.score,
             "observed": [{"img_id": o.img_id, "time_rel": f"{o.time_rel.numerator}/{o.time_rel.denominator}",
-                          "subjects": list(o.subjects), "scene": o.scene, "quality": o.quality,
-                          "motion_hint": o.motion_hint, "sample_time_s": round(float(o.time_rel), 3)} for o in top],
+                          "subjects": list(o.subjects), "scene": o.scene, "quality": o.quality} for o in top],
         }
 
     candidates_payload = [summarize(c) for c in candidates]
     candidates_payload = [c for c in candidates_payload if c["observed"]]
     grounded_ids = {c["candidate_id"] for c in candidates_payload}
+    evidence = {c["candidate_id"]: {o["img_id"]: Fraction(o["time_rel"]) for o in c["observed"]} for c in candidates_payload}
     key = cachekeys.selection_key(
         source_fingerprint=source.content_fingerprint, asset_id=asset.asset_id,
         model_id=client.model_id or "", focus_json=focus.to_json(),
         candidates=[c.to_json() for c in candidates],
         observations=[o.to_json() for o in observations],
-        inference_parameters={"temperature": config.temperature, "max_tokens": client.max_tokens},
+        inference_parameters={"temperature": config.temperature, "max_tokens": config.selection_max_tokens},
     )
     hit = cache.get(key)
     if hit is not None:
         metering.cache["selection"] = "hit"
-        selections, dropped = _selections_from_meta(hit[0]["selections"]), []
+        selections, dropped = _selections_from_meta(hit[0]["selections"], candidates, evidence), []
     else:
         metering.cache["selection"] = "miss"
         if cancel_event.is_set():
@@ -431,10 +435,7 @@ def _select(source, asset, cache, client, config, focus, candidates, observation
         view = views_by_id.get(cand.view_id)
         if view is None:
             return None
-        if sel.bbox is None:
-            return (view.yaw_deg, view.pitch_deg)
-        yaw, pitch = view.bbox_center_direction(sel.bbox)
-        return (round(yaw, 3), round(pitch, 3))
+        return (view.yaw_deg, view.pitch_deg)
 
     duration = sampling.duration_s
     plan = build_selection_plan(candidates, tuple(selections), focus, duration, selection_params,
@@ -442,15 +443,13 @@ def _select(source, asset, cache, client, config, focus, candidates, observation
     return plan, diagnostics
 
 
-def _selections_from_meta(items: list[dict]) -> list:
+def _selections_from_meta(items, candidates, evidence):
     from vibecut.analysis.plan import ModelSelection
-
-    return [
-        ModelSelection(
-            candidate_id=i["candidate_id"], selected=bool(i["selected"]), relevance=float(i["relevance"]),
-            confidence=float(i["confidence"]), reason=i["reason"], uncertainty=i.get("uncertainty"),
-            bbox=tuple(i["bbox"]) if i.get("bbox") else None,
-            event_time_s=float(i["event_time_s"]) if i.get("event_time_s") is not None else None,
-        )
-        for i in items
-    ]
+    from vibecut.analysis.validate import validate_selections
+    from vibecut.analysis.errors import ValidationFailureError
+    valid, dropped = validate_selections({"selections": items}, {c.candidate_id: (c.start_rel, c.end_rel) for c in candidates}, evidence)
+    if dropped:
+        raise ValidationFailureError("cached selection evidence is invalid")
+    return [ModelSelection(candidate_id=i["candidate_id"], selected=True, relevance=i["relevance"],
+                           confidence=i["confidence"], reason=i["reason"], img_ids=tuple(i["img_ids"]),
+                           times_rel=tuple(evidence[i["candidate_id"]][iid] for iid in i["img_ids"])) for i in valid]

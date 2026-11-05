@@ -30,13 +30,13 @@ from __future__ import annotations
 from typing import Any
 
 from vibecut.analysis.model import OBSERVE_PROMPT_VERSION, SELECT_PROMPT_VERSION, SELECTION_ALGORITHM_VERSION
-from vibecut.analysis.plan import ANALYSIS_SCHEMA_VERSION
+from vibecut.analysis.plan import ANALYSIS_SCHEMA_VERSION, VISUAL_CACHE_SCHEMA_VERSION
 from vibecut.core.cache import identity_digest
 
 
 def cheap_features_key(*, source_fingerprint: str, tool_identity: str, sampling_identity: dict) -> str:
     return identity_digest(
-        {"namespace": "analysis-cheap", "schema": ANALYSIS_SCHEMA_VERSION},
+        {"namespace": "analysis-cheap", "schema": VISUAL_CACHE_SCHEMA_VERSION},
         source_fingerprint, tool_identity, sampling_identity,
     )
 
@@ -53,7 +53,7 @@ def observation_key(
 ) -> str:
     """Prompt-independent observation-batch key; ``batch`` is canonical data."""
     return identity_digest(
-        {"namespace": "analysis-observation", "schema": ANALYSIS_SCHEMA_VERSION,
+        {"namespace": "analysis-observation", "schema": VISUAL_CACHE_SCHEMA_VERSION,
          "prompt_version": OBSERVE_PROMPT_VERSION},
         source_fingerprint, asset_id, tool_identity, sampling_identity, model_id, batch, inference_parameters,
     )

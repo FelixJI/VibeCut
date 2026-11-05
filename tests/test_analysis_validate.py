@@ -14,8 +14,8 @@ from vibecut.analysis.errors import StructuredOutputError, ValidationFailureErro
 
 
 def _sel(**over):
-    item = {"candidate_id": "c0001", "selected": True, "relevance": 0.9, "confidence": 0.8,
-            "reason": "画面中有跳舞的人", "uncertainty": None, "bbox": None, "event_time_s": None}
+    item = {"candidate_id": "c0001", "img_ids": ["image"], "relevance": 0.9, "confidence": 0.8,
+            "reason": "画面中有跳舞的人"}
     item.update(over)
     return {"selections": [item]}
 
@@ -34,7 +34,7 @@ def test_nan_infinity_literals_rejected():
 
 def test_unknown_candidate_id_dropped():
     raw = _sel(candidate_id="c9999")
-    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))})
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))}, {"c0001": {"image": Fraction(1)}})
     assert valid == [] and dropped
 
 
@@ -47,15 +47,15 @@ def test_unknown_candidate_id_dropped():
 ])
 def test_bad_bbox_dropped(bbox):
     raw = _sel(bbox=bbox)
-    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))})
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))}, {"c0001": {"image": Fraction(1)}})
     assert valid == []
     assert any("bbox" in d for d in dropped)
 
 
 def test_out_of_range_time_dropped():
     raw = _sel(event_time_s=5.0)
-    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))})
-    assert valid == [] and any("window" in d for d in dropped)
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))}, {"c0001": {"image": Fraction(1)}})
+    assert valid == [] and any("time" in d for d in dropped)
 
 
 @pytest.mark.parametrize("bad", [
@@ -72,16 +72,16 @@ def test_invalid_fields_dropped(bad):
     over = {"candidate_id": "c0001"}
     over.update(bad)
     raw = _sel(**over)
-    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))})
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))}, {"c0001": {"image": Fraction(1)}})
     assert valid == []
     assert dropped
 
 
 def test_valid_selection_passes():
-    raw = _sel(bbox={"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}, event_time_s=1.0)
-    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))})
+    raw = _sel()
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(2))}, {"c0001": {"image": Fraction(1)}})
     assert not dropped and len(valid) == 1
-    assert valid[0]["bbox"] == (0.1, 0.2, 0.3, 0.4)
+    assert valid[0]["img_ids"] == ["image"]
 
 
 def test_observation_unknown_img_id_rejected():
@@ -117,3 +117,30 @@ def test_missing_or_duplicate_observations_cannot_be_cached_as_full_coverage():
     for ids in (["a"], ["a", "a", "b"]):
         with pytest.raises(ValidationFailureError):
             validate.validate_observations(observe_payload(ids), frozenset({"a", "b"}))
+
+
+
+@pytest.mark.parametrize("extra", [
+    {"bbox": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}},
+    {"event_time_s": 9}, {"bbox": None},
+])
+def test_text_only_selection_cannot_invent_valid_looking_position_or_time(extra):
+    raw = _sel(**extra)
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(12))},
+                                                 {"c0001": {"image": Fraction(5)}})
+    assert not valid and dropped
+
+
+@pytest.mark.parametrize("ids", [["forged"], ["other-candidate-image"], ["image", "image"], []])
+def test_forged_cross_candidate_and_duplicate_image_ids_are_rejected(ids):
+    raw = _sel(img_ids=ids)
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(12)), "c2": (Fraction(0), Fraction(12))},
+                    {"c0001": {"image": Fraction(5)}, "c2": {"other-candidate-image": Fraction(9)}})
+    assert not valid and dropped
+
+
+@pytest.mark.parametrize("field", ["relevance", "confidence"])
+def test_huge_integer_business_number_is_rejected_without_overflow(field):
+    raw = _sel(**{field: 10 ** 400})
+    valid, dropped = validate.validate_selections(raw, {"c0001": (Fraction(0), Fraction(12))}, {"c0001": {"image": Fraction(5)}})
+    assert not valid and dropped

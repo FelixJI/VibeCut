@@ -13,14 +13,22 @@ from vibecut.analysis.plan import to_edit_plan
 from vibecut.core.contracts import CONTRACT_VERSION
 
 
+_CANDIDATES = {}
+
+
 def _cand(cid, start, end, view="eq+030", score=0.5, source_id="v1:abc"):
+    _CANDIDATES[cid] = (Fraction(start), Fraction(end))
     return CandidateWindow(candidate_id=cid, source_id=source_id, start_rel=Fraction(start),
                            end_rel=Fraction(end), view_id=view, origin="motion", score=score)
 
 
 def _sel(cid, relevance=0.9, confidence=0.9, reason="有人物活动", selected=True, **kw):
+    event = kw.pop("event_time_s", None)
+    kw.pop("bbox", None)
+    start, end = _CANDIDATES[cid]
+    time_rel = Fraction(str(event)) if event is not None else (start + end) / 2
     return ModelSelection(candidate_id=cid, selected=selected, relevance=relevance,
-                          confidence=confidence, reason=reason, **kw)
+                          confidence=confidence, reason=reason, img_ids=(cid + ".image",), times_rel=(time_rel,), **kw)
 
 
 def _focus(duration=30, text="人物优先"):
@@ -118,3 +126,32 @@ def test_trimmed_plan_keeps_actual_evidence_inside_retained_segment():
 def test_one_second_target_does_not_return_empty_when_material_exists():
     plan = build_selection_plan((_cand("c1", 0, 1),), (_sel("c1"),), _focus(duration=1), Fraction(1))
     assert plan.segments and plan.total_duration_s == 1
+
+
+
+def test_adjacent_selected_windows_consume_remaining_material_to_target():
+    candidates = (_cand("a", 0, 12), _cand("b", 12, 24), _cand("c", 24, 36))
+    result = build_selection_plan(candidates, tuple(_sel(c.candidate_id) for c in candidates), _focus(30), Fraction(36))
+    assert result.status == "complete"
+    assert abs(result.total_duration_s - 30) <= 1
+    assert all(s.duration_rel <= 15 and s.evidence for s in result.segments)
+    for a, b in zip(result.segments, result.segments[1:]):
+        assert a.cut_out_rel <= b.cut_in_rel
+    assert all(s.cut_in_rel <= e.time_rel < s.cut_out_rel for s in result.segments for e in s.evidence)
+
+
+def test_merge_never_fills_an_unobserved_gap():
+    candidates = (_cand("a", 0, 12), _cand("b", 13, 25))
+    result = build_selection_plan(candidates, (_sel("a"), _sel("b")), _focus(30), Fraction(25))
+    assert result.total_duration_s == 24
+    assert all(s.cut_out_rel <= 12 or s.cut_in_rel >= 13 for s in result.segments)
+
+
+
+def test_adjacent_windows_with_different_views_keep_separate_camera_segments():
+    candidates = (_cand("left", 0, 4, view="eq-150"), _cand("right", 4, 8, view="eq+30"))
+    result = build_selection_plan(candidates, (_sel("left"), _sel("right")), _focus(8), Fraction(8))
+    assert result.total_duration_s == 8
+    assert [(s.cut_in_rel, s.cut_out_rel, s.view_id) for s in result.segments] == [
+        (Fraction(0), Fraction(4), "eq-150"), (Fraction(4), Fraction(8), "eq+30")]
+    assert all(e.view_id == s.view_id for s in result.segments for e in s.evidence)

@@ -40,7 +40,7 @@ def test_selection_cannot_borrow_same_view_evidence_from_another_window(tmp_path
             assert payload[0]["observed"][0]["img_id"] == "real"
             assert payload[0]["observed"][0]["time_rel"] == f"{t.numerator}/{t.denominator}"
             assert "wrong" not in str(payload)
-            return [ModelSelection(candidate.candidate_id, True, 1, 1, "person")], [], []
+            return [ModelSelection(candidate.candidate_id, True, 1, 1, "person", img_ids=("real",), times_rel=(t,))], [], []
     source = SimpleNamespace(content_fingerprint="fixture")
     asset = SimpleNamespace(asset_id="fixture")
     result, _ = _select(source, asset, Cache(tmp_path), Client(), AnalysisConfig(), parse_focus("人物"),

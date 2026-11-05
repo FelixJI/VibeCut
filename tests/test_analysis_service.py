@@ -48,12 +48,13 @@ def _config(**over):
 
 
 def _select_all(candidates):
-    return select_payload([
-        {"candidate_id": c.candidate_id, "selected": True, "relevance": 0.9, "confidence": 0.85,
-         "reason": "检测到明显变化的人物活动", "uncertainty": None, "bbox": {"x": 0.2, "y": 0.2, "w": 0.5, "h": 0.6},
-         "event_time_s": float((c.start_rel + c.end_rel) / 2)}
-        for c in candidates
-    ])
+    items = []
+    times = (Fraction(1, 2), Fraction(3, 2), Fraction(5, 2))
+    for c in candidates:
+        index = next(i for i, t in enumerate(times) if c.start_rel <= t < c.end_rel)
+        items.append({"candidate_id": c.candidate_id, "img_ids": [f"s{index:02d}.{c.view_id}"],
+                      "relevance": 0.9, "confidence": 0.85, "reason": "检测到人物活动"})
+    return select_payload(items)
 
 
 def fill_observe_script(lm, samples: int, *, delay: float = 0.0) -> None:
@@ -226,9 +227,11 @@ def test_selection_plan_duration_and_evidence(luma_source, lm, tools, tmp_path):
     # cheap candidates first (no model) to script a matching selection
     cfg = _config()
     focus = parse_focus("人物优先，剪出3秒")
-    draft = analyze(luma_source, asset, tools, cache, _config(max_model_requests=0), focus,
+    lm.model_state = "not-loaded"
+    draft = analyze(luma_source, asset, tools, cache, _config(), focus,
                     transport=LoopbackTransport(lm.base_url, request_timeout_s=10.0))
-    assert draft.status == "partial"  # budget 0: observe skipped, selection with no observations
+    assert draft.status == "ai-unavailable"
+    lm.model_state = "loaded"
     # now script selection over the real candidate ids
     lm.chat_script.append({"content": _select_all(draft.candidates)})
     result = analyze(luma_source, asset, tools, cache, cfg, focus,
@@ -253,8 +256,8 @@ def test_rejected_model_text_never_leaks_into_results(luma_source, lm, tools, tm
     asset = ensure_proxy(luma_source, tools, cache)
     fill_observe_script(lm, 1)
     lm.chat_script.append({"content": select_payload([
-        {"candidate_id": "cXXXX", "selected": True, "relevance": 0.9, "confidence": 0.9,
-         "reason": "see https://evil.example/x", "uncertainty": None, "bbox": None, "event_time_s": None},
+        {"candidate_id": "cXXXX", "img_ids": ["unknown"], "relevance": 0.9, "confidence": 0.9,
+         "reason": "see https://evil.example/x"},
     ])})
     result = analyze(luma_source, asset, tools, cache, _config(samples=1), parse_focus("人物优先"),
                      transport=LoopbackTransport(lm.base_url, request_timeout_s=10.0))

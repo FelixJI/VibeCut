@@ -152,21 +152,21 @@ def test_select_validates_and_maps_oom():
     try:
         client, _ = _client(lm)
         lm.chat_script.append({"content": select_payload([
-            {"candidate_id": "c0001", "selected": True, "relevance": 0.9, "confidence": 0.8,
-             "reason": "有人物跳舞", "uncertainty": None, "bbox": None, "event_time_s": 1.0},
+            {"candidate_id": "c0001", "img_ids": ["image"], "relevance": 0.9, "confidence": 0.8,
+             "reason": "有人物跳舞"},
         ])})
         sels, repairs, dropped = client.select(
-            {"priority": "person"}, [{"candidate_id": "c0001"}], {"c0001": (Fraction(0), Fraction(2))},
+            {"priority": "person"}, [{"candidate_id": "c0001", "observed": [{"img_id": "image", "time_rel": "1/1"}]}], {"c0001": (Fraction(0), Fraction(2))},
         )
         assert len(sels) == 1 and not dropped and not repairs
 
         lm.chat_script.append({"status": 500, "message": "CUDA out of memory while loading KV cache"})
         with pytest.raises(ModelOOMError):
-            client.select({"priority": "person"}, [{"candidate_id": "c0001"}], {"c0001": (Fraction(0), Fraction(2))})
+            client.select({"priority": "person"}, [{"candidate_id": "c0001", "observed": [{"img_id": "image", "time_rel": "1/1"}]}], {"c0001": (Fraction(0), Fraction(2))})
 
         lm.chat_script.append({"status": 400, "message": "image input is not supported by this model"})
         with pytest.raises((NoVisionError, ModelAPIError)):
-            client.select({"priority": "person"}, [{"candidate_id": "c0001"}], {"c0001": (Fraction(0), Fraction(2))})
+            client.select({"priority": "person"}, [{"candidate_id": "c0001", "observed": [{"img_id": "image", "time_rel": "1/1"}]}], {"c0001": (Fraction(0), Fraction(2))})
     finally:
         lm.stop()
 
@@ -179,12 +179,12 @@ def test_select_repair_drops_bad_items_keeps_good_ones():
         client, _ = _client(lm)
         windows = {"c0001": (Fraction(0), Fraction(2)), "c0002": (Fraction(5), Fraction(8))}
         lm.chat_script.append({"content": select_payload([
-            {"candidate_id": "cXXXX", "selected": True, "relevance": 1, "confidence": 1,
-             "reason": "x", "uncertainty": None, "bbox": None, "event_time_s": None},
-            {"candidate_id": "c0002", "selected": True, "relevance": 0.7, "confidence": 0.6,
-             "reason": "风景好", "uncertainty": None, "bbox": None, "event_time_s": None},
+            {"candidate_id": "cXXXX", "img_ids": ["image"], "relevance": 1, "confidence": 1,
+             "reason": "x"},
+            {"candidate_id": "c0002", "img_ids": ["image"], "relevance": 0.7, "confidence": 0.6,
+             "reason": "风景好"},
         ])})
-        sels, repairs, dropped = client.select({"priority": "scenery"}, [{"candidate_id": "c0001"}], windows)
+        sels, repairs, dropped = client.select({"priority": "scenery"}, [{"candidate_id": "c0002", "observed": [{"img_id": "image", "time_rel": "6/1"}]}], windows)
         assert [s.candidate_id for s in sels] == ["c0002"]
         assert dropped  # bad id recorded, dropped item never enters a plan
     finally:
@@ -253,5 +253,26 @@ def test_truncated_output_is_metered_without_reasoning_text():
         assert meter.requests[0]["finish_reason"] == "length"
         assert meter.requests[0]["output_token_budget"] == 2048
         assert "private thinking" not in json.dumps(meter.to_json())
+    finally:
+        lm.stop()
+
+
+
+def test_one_observed_image_cannot_be_moved_to_another_time_or_bbox():
+    from fractions import Fraction
+    from vibecut.analysis.errors import ValidationFailureError
+    lm = OfflineLM().start()
+    try:
+        client, _ = _client(lm, max_repair_retries=0)
+        payload = [{"candidate_id": "c1", "observed": [{"img_id": "actual-image", "time_rel": "5/1"}]}]
+        base = {"candidate_id": "c1", "img_ids": ["actual-image"], "relevance": 1, "confidence": 1, "reason": "red square"}
+        for extra in ({"event_time_s": 9}, {"bbox": {"x": 0, "y": 0, "w": 1, "h": 1}}, {"relevance": 10 ** 400}):
+            lm.chat_script.append({"content": {"selections": [{**base, **extra}]}})
+            with pytest.raises(ValidationFailureError):
+                client.select({}, payload, {"c1": (Fraction(0), Fraction(12))})
+        lm.chat_script.append({"content": {"selections": [base]}})
+        selections, _, _ = client.select({}, payload, {"c1": (Fraction(0), Fraction(12))})
+        assert selections[0].times_rel == (Fraction(5),)
+        assert selections[0].img_ids == ("actual-image",)
     finally:
         lm.stop()

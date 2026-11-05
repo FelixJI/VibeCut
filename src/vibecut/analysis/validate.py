@@ -6,10 +6,8 @@ correctness. Everything is re-validated here:
     *we* provided (the model can only pick, never invent);
   * numbers must be finite and in range; ``NaN``/``Infinity`` literals are
     rejected at the JSON parse layer;
-  * bbox is normalized in-view ``[0,1]^2`` with positive extent inside the
-    frame;
-  * optional ``event_time_s`` must fall inside the referenced candidate's
-    window (no out-of-range times);
+  * selection img_ids must belong to the exact provided candidate; location
+    and arbitrary event-time fields are rejected;
   * free text (reason/uncertainty/subjects/scene) must not look like URLs,
     absolute paths or shell command fragments - such content is rejected,
     never executed, and never reaches a plan.
@@ -74,25 +72,13 @@ def sanitize_text(value: Any, *, max_len: int = MAX_REASON_LEN) -> str | None:
 def _finite_number(value: Any, *, low: float, high: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    v = float(value)
+    try:
+        v = float(value)
+    except (OverflowError, ValueError):
+        return None
     if not math.isfinite(v) or not low <= v <= high:
         return None
     return v
-
-
-def _validate_bbox(raw: Any) -> tuple[float, float, float, float] | None:
-    if not isinstance(raw, dict):
-        return None
-    try:
-        x, y = _finite_number(raw["x"], low=0.0, high=1.0), _finite_number(raw["y"], low=0.0, high=1.0)
-        w, h = _finite_number(raw["w"], low=1e-6, high=1.0), _finite_number(raw["h"], low=1e-6, high=1.0)
-    except KeyError:
-        return None
-    if x is None or y is None or w is None or h is None:
-        return None
-    if x + w > 1.0 + 1e-9 or y + h > 1.0 + 1e-9:
-        return None
-    return (min(x, 1.0), min(y, 1.0), min(w, 1.0 - x + 1e-9), min(h, 1.0 - y + 1e-9))
 
 
 def validate_observations(raw: Any, provided_img_ids: frozenset[str]) -> list[dict]:
@@ -137,64 +123,42 @@ def validate_observations(raw: Any, provided_img_ids: frozenset[str]) -> list[di
     return out
 
 
-def validate_selections(
-    raw: Any,
-    candidates: dict[str, tuple],  # candidate_id -> (start_rel, end_rel) Fractions
-) -> tuple[list[dict], list[str]]:
-    """Validate a select-stage payload.
-
-    Returns ``(valid_items, dropped_reasons)``. Invalid single items are
-    dropped (recorded, never entering a plan); if *nothing* is valid the
-    caller treats the stage as failed after its bounded repair retry.
-    """
-    if not isinstance(raw, dict) or not isinstance(raw.get("selections"), list):
+def validate_selections(raw: Any, candidates: dict[str, tuple], evidence: dict[str, dict]) -> tuple[list[dict], list[str]]:
+    """Selection may cite only provided images; it cannot invent time or location."""
+    if not isinstance(raw, dict) or set(raw) != {"selections"} or not isinstance(raw["selections"], list):
         raise ValidationFailureError("select payload must be {'selections': [...]}")
-    valid: list[dict] = []
-    dropped: list[str] = []
-    for i, item in enumerate(raw["selections"][:128]):
-        if not isinstance(item, dict):
-            dropped.append(f"item {i}: not an object")
+    if len(raw["selections"]) > 128:
+        raise ValidationFailureError("too many selections")
+    valid, dropped, seen = [], [], set()
+    fields = {"candidate_id", "img_ids", "relevance", "confidence", "reason"}
+    for i, item in enumerate(raw["selections"]):
+        if not isinstance(item, dict) or set(item) != fields:
+            dropped.append(f"item {i}: selection fields invalid; bbox/time/location are forbidden")
             continue
-        cid = item.get("candidate_id")
-        if not isinstance(cid, str) or cid not in candidates:
-            dropped.append(f"item {i}: candidate_id not among provided candidates")
+        cid = item["candidate_id"]
+        if not isinstance(cid, str) or cid not in candidates or cid in seen:
+            dropped.append(f"item {i}: unknown or duplicate candidate_id")
             continue
-        start_rel, end_rel = candidates[cid]
-        if not isinstance(item.get("selected"), bool):
-            dropped.append(f"{cid}: selected must be boolean")
+        ids = item["img_ids"]
+        allowed = evidence.get(cid, {})
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 4
+                or any(not isinstance(iid, str) or iid not in allowed for iid in ids)
+                or len(set(ids)) != len(ids)):
+            dropped.append(f"{cid}: img_ids must cite this candidate's provided images exactly once")
             continue
-        relevance = _finite_number(item.get("relevance"), low=0.0, high=1.0)
-        confidence = _finite_number(item.get("confidence"), low=0.0, high=1.0)
-        if relevance is None or confidence is None:
-            dropped.append(f"{cid}: relevance/confidence must be finite in [0,1]")
+        start, end = candidates[cid]
+        if any(not start <= allowed[iid] < end for iid in ids):
+            dropped.append(f"{cid}: image evidence is outside candidate window")
             continue
-        reason = sanitize_text(item.get("reason"))
-        if reason is None:
-            dropped.append(f"{cid}: reason missing/invalid (URL/path/command-like text rejected)")
+        relevance = _finite_number(item["relevance"], low=0, high=1)
+        confidence = _finite_number(item["confidence"], low=0, high=1)
+        reason = sanitize_text(item["reason"])
+        if relevance is None or confidence is None or reason is None:
+            dropped.append(f"{cid}: invalid relevance/confidence/reason")
             continue
-        uncertainty = item.get("uncertainty")
-        if uncertainty is not None:
-            uncertainty = sanitize_text(uncertainty)
-            if uncertainty is None:
-                dropped.append(f"{cid}: invalid uncertainty text")
-                continue
-        bbox = item.get("bbox")
-        if bbox is not None:
-            bbox = _validate_bbox(bbox)
-            if bbox is None:
-                dropped.append(f"{cid}: bbox invalid (must be normalized [0,1] inside frame)")
-                continue
-        event_time = item.get("event_time_s")
-        if event_time is not None:
-            event_time = _finite_number(event_time, low=float(start_rel), high=float(end_rel))
-            if event_time is None or event_time >= float(end_rel):
-                dropped.append(f"{cid}: event_time_s outside candidate window [{float(start_rel):.3f},{float(end_rel):.3f}]")
-                continue
-        valid.append({
-            "candidate_id": cid, "selected": item["selected"], "relevance": relevance,
-            "confidence": confidence, "reason": reason, "uncertainty": uncertainty,
-            "bbox": bbox, "event_time_s": event_time,
-        })
+        seen.add(cid)
+        valid.append({"candidate_id": cid, "img_ids": ids, "relevance": relevance,
+                      "confidence": confidence, "reason": reason})
     return valid, dropped
 
 

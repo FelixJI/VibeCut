@@ -1,4 +1,4 @@
-"""Data objects of the analysis pipeline (task #5, analysis-local schema v1).
+"""Data objects of the analysis pipeline (task #5, analysis-local schema v2).
 
 These are *analysis-local* contracts; shared repo contracts (EditPlan etc.)
 stay frozen in :mod:`vibecut.core.contracts`. ``to_edit_plan`` maps one
@@ -16,7 +16,8 @@ from typing import Any, Optional
 
 from vibecut.core.contracts import CONTRACT_VERSION, CameraPath, CameraView, EditPlan, frac_str
 
-ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION = 2
+VISUAL_CACHE_SCHEMA_VERSION = 1  # observation contract/prompt unchanged; reuse verified visual caches
 
 
 @dataclass(frozen=True)
@@ -69,8 +70,8 @@ class ModelSelection:
     confidence: float
     reason: str
     uncertainty: Optional[str] = None
-    bbox: Optional[tuple[float, float, float, float]] = None
-    event_time_s: Optional[float] = None
+    img_ids: tuple[str, ...] = ()
+    times_rel: tuple[Fraction, ...] = ()
 
     @property
     def weight(self) -> float:
@@ -78,10 +79,9 @@ class ModelSelection:
 
     def to_json(self) -> dict:
         return {
-            "candidate_id": self.candidate_id, "selected": self.selected,
+            "candidate_id": self.candidate_id, "img_ids": list(self.img_ids),
             "relevance": self.relevance, "confidence": self.confidence,
-            "reason": self.reason, "uncertainty": self.uncertainty,
-            "bbox": list(self.bbox) if self.bbox else None, "event_time_s": self.event_time_s,
+            "reason": self.reason,
         }
 
 
@@ -92,15 +92,17 @@ class EvidenceRef:
     candidate_id: str
     time_rel: Fraction
     view_id: str
-    bbox: Optional[tuple[float, float, float, float]] = None
+    img_id: str = ""
+    source_id: str = ""
     direction: Optional[tuple[float, float]] = None  # canonical yaw/pitch deg
 
     def to_json(self) -> dict:
         return {
             "candidate_id": self.candidate_id, "time_rel": frac_str(self.time_rel),
             "view_id": self.view_id,
-            "bbox": list(self.bbox) if self.bbox else None,
-            "direction_yaw_pitch_deg": list(self.direction) if self.direction else None,
+            "img_id": self.img_id, "source_id": self.source_id,
+            "direction_kind": "view-center",
+            "view_direction_yaw_pitch_deg": list(self.direction) if self.direction else None,
         }
 
 
