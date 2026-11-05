@@ -34,10 +34,10 @@ from vibecut.analysis.plan import ANALYSIS_SCHEMA_VERSION, VISUAL_CACHE_SCHEMA_V
 from vibecut.core.cache import identity_digest
 
 
-def cheap_features_key(*, source_fingerprint: str, tool_identity: str, sampling_identity: dict) -> str:
+def cheap_features_key(*, source_fingerprint: str, asset_id: str, tool_identity: str, sampling_identity: dict) -> str:
     return identity_digest(
         {"namespace": "analysis-cheap", "schema": VISUAL_CACHE_SCHEMA_VERSION},
-        source_fingerprint, tool_identity, sampling_identity,
+        source_fingerprint, asset_id, tool_identity, sampling_identity,
     )
 
 

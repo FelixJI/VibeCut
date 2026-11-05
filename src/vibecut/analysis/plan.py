@@ -17,7 +17,7 @@ from typing import Any, Optional
 from vibecut.core.contracts import CONTRACT_VERSION, CameraPath, CameraView, EditPlan, frac_str
 
 ANALYSIS_SCHEMA_VERSION = 2
-VISUAL_CACHE_SCHEMA_VERSION = 1  # observation contract/prompt unchanged; reuse verified visual caches
+VISUAL_CACHE_SCHEMA_VERSION = 2  # exact displayed-frame extraction; old image/time equivalence is unproven
 
 
 @dataclass(frozen=True)

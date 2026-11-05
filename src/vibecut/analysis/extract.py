@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Optional
@@ -75,6 +76,35 @@ def extract_gray_stream(
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
+@dataclass(frozen=True)
+class AssetTiming:
+    first_pts: int
+    time_base: Fraction
+    timeline_origin: Fraction
+    fps: Fraction
+
+
+def probe_asset_timing(tools, media_path, *, expected_fps, expected_frames):
+    """Reuse #2's packet validation once per asset, without hashing/decoding it."""
+    from vibecut.media.probe import _ffprobe_json, _video_packet_pts, _verify_cfr, ProbeError, UnsupportedSourceError
+    try:
+        data = _ffprobe_json(tools, Path(media_path), ["-show_format", "-show_streams"])
+        videos = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
+        if len(videos) != 1:
+            raise ExtractionError("analysis asset must contain exactly one video stream")
+        video = videos[0]
+        time_base = Fraction(video["time_base"])
+        pts = _video_packet_pts(tools, Path(media_path), int(video["index"]))
+        first, fps = _verify_cfr(pts, time_base, Fraction(video["avg_frame_rate"]),
+                                 int(video["start_pts"]) if video.get("start_pts") is not None else None)
+        if fps != expected_fps or len(pts) != expected_frames:
+            raise ExtractionError("asset displayed packet timing disagrees with verified source")
+        origin = Fraction(data.get("format", {}).get("start_time", str(first * time_base)))
+        return AssetTiming(first, time_base, origin, fps)
+    except (ProbeError, UnsupportedSourceError, KeyError, ValueError, ZeroDivisionError) as exc:
+        raise ExtractionError("cannot verify analysis asset displayed timing") from exc
+
+
 def extract_perspective_jpeg(
     tools,
     media_path: str,
@@ -83,6 +113,7 @@ def extract_perspective_jpeg(
     out_dir: Path,
     *,
     cancel_event: Optional[threading.Event],
+    timing: AssetTiming,
     timeout_s: float = 120.0,
 ) -> Path:
     """One perspective JPEG for (time, view) via the frozen v360 mapping."""
@@ -93,10 +124,18 @@ def extract_perspective_jpeg(
                     roll_deg=view.roll_deg, h_fov_deg=view.h_fov_deg)
     vf = v360_filter(cv, view.width, view.height)
     safe_view = "".join(c if c.isalnum() or c in "+-._" else "_" for c in view.view_id)
-    out = out_dir / f"s{float(t_rel):09.3f}_v{safe_view}.jpg"
+    ticks = Fraction(t_rel) / timing.time_base
+    if t_rel < 0 or ticks.denominator != 1 or (t_rel * timing.fps).denominator != 1:
+        raise ExtractionError("image time is not a verified displayed frame")
+    target_pts = timing.first_pts + int(ticks)
+    # Input seek avoids decoding from the beginning; retain original PTS for exact trim.
+    seek = max(0, int(target_pts * timing.time_base - timing.timeline_origin) - 1)
+    vf = (f"settb=expr={timing.time_base.numerator}/{timing.time_base.denominator},"
+          f"trim=start_pts={target_pts}:end_pts={target_pts + 1}," + vf)
+    out = out_dir / f"pts{target_pts}_v{safe_view}.jpg"
     argv = tools.ffmpeg_argv(
-        "-ss", f"{float(t_rel):.3f}", "-i", str(media_path), "-map", "0:v:0", "-an",
-        "-frames:v", "1", "-vf", vf, "-q:v", "4", "-y", str(out),
+        "-copyts", "-ss", str(seek), "-i", str(media_path), "-map", "0:v:0", "-an",
+        "-frames:v", "1", "-fps_mode", "passthrough", "-vf", vf, "-q:v", "4", "-y", str(out),
     )
     res = tools.run(argv, timeout_s=timeout_s, cancel_event=cancel_event)
     _require_ffmpeg_ok(res, f"perspective jpeg {view.view_id}@{float(t_rel):.3f}s")

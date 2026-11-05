@@ -173,15 +173,18 @@ def analyze(
                 raise ExtractionError("only assets starting at source-relative 0 are analysable in this task")
             asset_id = asset.asset_id
             duration = _source_duration_s(source)
+            from vibecut.analysis.extract import probe_asset_timing
+            asset_timing = probe_asset_timing(tools, asset.path, expected_fps=source.video.fps,
+                                              expected_frames=source.video.nb_frames)
 
         from vibecut.analysis.views import default_view_set
         batches_per_sample = (len(default_view_set()) + config.max_images_per_request - 1) // config.max_images_per_request
         # Redistribute affordable samples across the whole source, reserving selection + one repair.
         effective_samples = min(config.samples, max(1, (config.max_model_requests - 2) // batches_per_sample))
-        metering.budget["effective_samples"] = effective_samples
         sampling = plan_sampling(duration, samples=effective_samples, views=tuple(
             replace(v, width=config.image_width, height=config.image_height) for v in default_view_set()
-        ))
+        ), verified_fps=asset_timing.fps)
+        metering.budget["effective_samples"] = len(sampling.times)
 
         with _StageTimer(metering, "cheap-features"):
             features = _cheap_features(source, asset, tools, cache, sampling, config, cancel_event, metering)
@@ -212,7 +215,7 @@ def analyze(
 
         with _StageTimer(metering, "observe"):
             observations, partial_reason = _observe(
-                source, asset, tools, cache, client, config, sampling, metering, cancel_event, observations,
+                source, asset, tools, cache, client, config, sampling, metering, cancel_event, observations, asset_timing,
             )
 
         with _StageTimer(metering, "select"):
@@ -271,7 +274,7 @@ def _tool_identity(tools) -> str:
 
 def _cheap_features(source, asset, tools, cache, sampling, config, cancel_event, metering):
     key = cachekeys.cheap_features_key(
-        source_fingerprint=source.content_fingerprint,
+        source_fingerprint=source.content_fingerprint, asset_id=asset.asset_id,
         tool_identity=_tool_identity(tools),
         sampling_identity=sampling.identity(),
     )
@@ -293,7 +296,7 @@ def _cheap_features(source, asset, tools, cache, sampling, config, cancel_event,
     return features
 
 
-def _observe(source, asset, tools, cache, client, config, sampling, metering, cancel_event, observations):
+def _observe(source, asset, tools, cache, client, config, sampling, metering, cancel_event, observations, asset_timing):
     """Per-sample batches of perspective JPEGs; cached per batch (prompt-free)."""
     from vibecut.analysis.extract import extract_perspective_jpeg
 
@@ -335,7 +338,7 @@ def _observe(source, asset, tools, cache, client, config, sampling, metering, ca
                 for iid, tt, v in img_metas:
                     jpeg = extract_perspective_jpeg(
                         tools, asset.path, tt, v, out_dir,
-                        cancel_event=cancel_event, timeout_s=config.ffmpeg_timeout_s,
+                        cancel_event=cancel_event, timing=asset_timing, timeout_s=config.ffmpeg_timeout_s,
                     )
                     images.append((iid, jpeg.read_bytes()))
                 meta = {iid: (t, v.view_id) for iid, t, v in img_metas}

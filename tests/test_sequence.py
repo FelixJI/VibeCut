@@ -51,21 +51,18 @@ def test_command_preparation_is_interruptible_after_it_started(tmp_path,monkeypa
     cancel=threading.Event()
     original=BoundCameraPath.evaluate
     evaluations=0
-    timer=None
     def observe(self,source_rel):
-        nonlocal evaluations,timer
+        nonlocal evaluations
         evaluations+=1
+        value=original(self,source_rel)
         if evaluations==1 and mode=="cancel":
-            timer=threading.Timer(.01,cancel.set);timer.start()
-        return original(self,source_rel)
+            cancel.set()  # preparation has evaluated a frame; stop synchronously before the next
+        return value
     monkeypatch.setattr(BoundCameraPath,"evaluate",observe)
     started=time.monotonic()
-    try:
-        with pytest.raises(ArtifactProcessError,match="cancelled.*preparation" if mode=="cancel" else "preparation timed out"):
-            build_sequence_argv({"asset":source},plan,StaticRenderConfig(timeout_s=.01 if mode=="timeout" else 5),
-                                tmp_path/"out.mp4",tmp_path,cancel_event=cancel)
-    finally:
-        if timer:timer.cancel();timer.join()
+    with pytest.raises(ArtifactProcessError,match="cancelled.*preparation" if mode=="cancel" else "preparation timed out"):
+        build_sequence_argv({"asset":source},plan,StaticRenderConfig(timeout_s=.01 if mode=="timeout" else 5),
+                            tmp_path/"out.mp4",tmp_path,cancel_event=cancel)
     elapsed=time.monotonic()-started
     assert 0 < evaluations < 3600
     assert elapsed < 1

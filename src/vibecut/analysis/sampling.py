@@ -42,7 +42,7 @@ class SamplingPlan:
         }
 
 
-def plan_sampling(duration_s: Fraction, *, samples: int, views: tuple[ViewSpec, ...] | None = None) -> SamplingPlan:
+def plan_sampling(duration_s: Fraction, *, samples: int, views: tuple[ViewSpec, ...] | None = None, verified_fps: Fraction | None = None) -> SamplingPlan:
     """Evenly spread ``samples`` interior times across the *whole* timeline.
 
     Times are bin midpoints, never t=0 alone, so the plan structurally cannot
@@ -53,4 +53,11 @@ def plan_sampling(duration_s: Fraction, *, samples: int, views: tuple[ViewSpec, 
         raise ValueError(f"samples must be 1..{MAX_SAMPLES} (got {samples})")
     views = views if views is not None else default_view_set()
     times = tuple(Fraction(2 * i + 1) * duration_s / (2 * samples) for i in range(samples))
+    if verified_fps is not None:
+        # verified_fps comes from uniform displayed packet PTS, never rate tags.
+        fps = Fraction(verified_fps)
+        frame_count = duration_s * fps
+        if fps <= 0 or frame_count.denominator != 1 or frame_count < 1:
+            raise ValueError("verified CFR duration must contain whole displayed frames")
+        times = tuple(sorted({Fraction(min(int(t * fps), int(frame_count) - 1)) / fps for t in times}))
     return SamplingPlan(times=times, views=views, duration_s=duration_s)
