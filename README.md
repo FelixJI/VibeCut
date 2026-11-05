@@ -11,7 +11,7 @@ VibeCut 把单目 equirectangular（360° 全景）SDR MP4 剪成**普通平面�
 #   VIBECUT_FFMPEG=C:\tools\ffmpeg\bin\ffmpeg.exe
 #   VIBECUT_FFPROBE=C:\tools\ffmpeg\bin\ffprobe.exe
 uv sync --frozen             # 安装锁定环境（运行时零第三方依赖，dev 组为 pytest）
-uv run vibecut init ./proj   # 建工程（vibecut.project.json, project schema v1, revision 1）
+uv run vibecut init ./proj   # 建工程（vibecut.project.json, project schema v2, revision 1）
 uv run vibecut inspect 输入.mp4 --projection equirect   # 打印 MediaSource 合同
 uv run vibecut add-source ./proj 输入.mp4 --projection equirect
 uv run vibecut export ./proj 输入.mp4 成片.mp4 --projection equirect --yaw 90 --pitch 0 --hfov 90
@@ -98,7 +98,7 @@ Windows 产物提交需要目标文件系统支持硬链接且运行环境允许
 
 ## 动态相机与多源剪辑（任务 #4）
 
-旧 `CameraPath` / `EditPlan` schema v2、静态 API 和旧工程保持可读。`core.sequence` 独立提供 schema v1：
+旧 `CameraPath` / `EditPlan` schema v2、静态 API 和旧 schema1 工程保持可读。工程保存升级为 project schema2，使旧读取器明确拒绝，而非忽略并丢失 `sequences`；contract schema 仍为 v2。`core.sequence` 独立提供 schema v1：
 `BoundCameraPath(asset_id, aspect, camera, cuts, geometry_revision=1)`、`SequenceClip(source_id, cut_in_rel, cut_out_rel, path)` 和 `SequencePlan(clips, project_fps, aspect, audio=True)`。
 这里 asset_id 绑定已探测原素材的 source_id（其内容身份已由 #2 指纹合同验证），geometry revision 1 固定绝对 Ry(yaw) Rx(pitch) Rz(roll) 世界参考。
 

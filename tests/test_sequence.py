@@ -307,3 +307,71 @@ def test_sequence_cli_persists_and_rerenders(tools,tmp_path,monkeypatch):
     assert decode_gray_frames(tools,tmp_path/"cached.mp4",640,360)==decode_gray_frames(tools,tmp_path/"cli.mp4",640,360)
     data.write_text('{"schema_version":99}',encoding="utf-8")
     assert main(["render-sequence",str(project.path),str(data),str(tmp_path/"invalid.mp4"),"--cpu"])==2
+
+
+@requires_ffmpeg
+def test_dynamic_output_path_survives_both_filter_escape_layers(tools, tmp_path):
+    directory = tmp_path / "中文 single'quote space,semi;[brackets]"
+    directory.mkdir()
+    src = make_marker_equirect(tools, directory / "source's 空格,;[].mp4", yaw_deg=0, pitch_deg=0, frames=6)
+    source = probe_source(src, tools, declared_projection="equirect")
+    out = directory / "out's 空格,;[].mp4"
+    result = render_sequence(sequence(source), {source.source_id: source}, tools, out,
+                             StaticRenderConfig(out_width=320, out_height=180))
+    assert result.status == "succeeded", result.error
+    assert len(decode_gray_frames(tools, out, 320, 180)) == 6
+    assert not list(directory.glob(".vibecut-camera-*"))
+
+
+@requires_ffmpeg
+def test_mixed_source_fps_and_distinct_origins_keep_av_boundaries(tools, tmp_path):
+    output_fps = F(30000, 1001)
+    sources = []
+    source_fps = (F(24), output_fps)
+    origins = (F(3, 2), F(7, 2))
+    # Each independently clocked source starts dark/silent and changes at its sixth displayed frame.
+    for n, (fps, origin) in enumerate(zip(source_fps, origins)):
+        video = make_luma_step_video(tools, tmp_path / f"video{n}.mp4", width=320, height=160,
+                                     fps=fps, frames=48 if n == 0 else 60, step_frame=6,
+                                     ts_offset=float(origin))
+        tone = make_tone_audio(tools, tmp_path / f"tone{n}.m4a", seconds=3, onset_s=float(F(6)/fps))
+        av = tmp_path / f"av{n}.mp4"
+        mux = run_ffmpeg(tools, ["-copyts", "-i", str(video), "-itsoffset", str(float(origin)), "-i", str(tone),
+                                "-map", "0:v", "-map", "1:a", "-c", "copy", "-y", str(av)])
+        assert mux.returncode == 0, mux.stderr
+        sources.append(probe_source(av, tools, declared_projection="equirect"))
+    assert sources[0].video.fps == 24 and sources[1].video.fps == output_fps
+    for source, origin in zip(sources, origins):
+        assert abs(source.first_video_frame_seconds - origin) <= source.video.time_base
+    length = F(15) / output_fps
+    # Different source-relative cut-ins plus different absolute origins exercise both mappings.
+    starts = (F(2)/24, F(3)/output_fps)
+    clips = tuple(SequenceClip(source.source_id, start, start + length,
+                               path(source.source_id, F(source.video.nb_frames)/source.video.fps))
+                  for source, start in zip(sources, starts))
+    plan = SequencePlan(clips, output_fps)
+    out = tmp_path / "mixed-clocks.mp4"
+    result = render_sequence(plan, {s.source_id: s for s in sources}, tools, out,
+                             StaticRenderConfig(out_width=320, out_height=180, crf=0))
+    assert result.status == "succeeded", result.error
+    frames = decode_gray_frames(tools, out, 320, 180)
+    assert len(frames) == 30
+    observed = []
+    for n, (fps, cut_in) in enumerate(zip(source_fps, starts)):
+        index = first_bright_frame_index(frames[n*15:(n+1)*15], 320, 180)
+        expected = (F(6)/fps - cut_in) * output_fps
+        assert index is not None and abs(F(index) - expected) <= 1
+        # Decode the actual final output's audio within each concatenated segment.
+        segment = tmp_path / f"audio-boundary{n}.mp4"
+        split = run_ffmpeg(tools, ["-i", str(out), "-ss", str(float(n*length)), "-t", str(float(length)),
+                                  "-map", "0:a:0", "-c:a", "aac", "-y", str(segment)])
+        assert split.returncode == 0, split.stderr
+        audio = audio_onset_seconds(tools, segment)
+        expected_audio = float(F(6)/fps-cut_in)
+        video_time = index/float(output_fps)
+        assert abs(audio - expected_audio) <= .080
+        assert abs(audio - video_time) <= .080
+        observed.append({"source_fps": str(fps), "source_origin": str(sources[n].first_video_frame_seconds),
+                         "video_frame": index, "expected_frame": float(expected), "audio_onset": audio,
+                         "expected_audio": expected_audio})
+    print("MIXED_CLOCK_EVIDENCE", observed)

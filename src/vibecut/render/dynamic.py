@@ -9,7 +9,11 @@ from vibecut.core.sequence import SequencePlan
 
 
 def _filter_path(path: Path) -> str:
-    return "'" + str(path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "'\\''") + "'"
+    value = str(path.resolve()).replace("\\", "/")
+    # Filename option parsing follows filtergraph parsing; each layer consumes its own escapes.
+    for special in ("\\':", "\\'[],; "):
+        value = "".join("\\" + char if char in special else char for char in value)
+    return value
 
 
 def probe_backends(tools, directory, timeout_s, cancel_event):

@@ -37,7 +37,7 @@ from vibecut.core.contracts import (
 )
 from vibecut.core.sequence import SequencePlan
 
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2  # v2 adds sequences; old readers must not silently discard them
 PROJECT_FILENAME = "vibecut.project.json"
 MAX_JOB_EVENTS = 200
 
@@ -114,7 +114,7 @@ class Project:
             raise ProjectError(f"project file not found: {path}") from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ProjectFormatError(f"corrupt project file {path}: {exc}") from exc
-        if raw.get("project_schema_version") != PROJECT_SCHEMA_VERSION:
+        if raw.get("project_schema_version") not in (1, PROJECT_SCHEMA_VERSION):
             raise ProjectFormatError(
                 f"unsupported project schema_version {raw.get('project_schema_version')!r}"
             )
