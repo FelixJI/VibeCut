@@ -33,6 +33,18 @@ class CacheError(RuntimeError):
 
 
 def _hash_parts(*parts: Any) -> str:
+    return identity_digest(*parts)
+
+
+def identity_digest(*parts: Any) -> str:
+    """Single-pass cache-identity digest over canonical JSON parts.
+
+    This is THE one hash mechanism behind every cache namespace in the
+    repo (normalized assets, renders and - via ``analysis.cachekeys`` -
+    the task-#5 observation/selection caches). Keys are pure functions of
+    the canonical parts fed in here; parts are canonical JSON documents
+    (sorted keys), so identity never depends on dict ordering or filenames.
+    """
     digest = hashlib.sha256()
     for part in parts:
         digest.update(json.dumps(part, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))

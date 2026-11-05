@@ -82,6 +82,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sequence.add_argument("--cpu", action="store_true", help="disable actual NVDEC/NVENC probes")
     p_sequence.add_argument("--unique-suffix", action="store_true")
     p_sequence.add_argument("--timeout", type=float, default=600.0)
+    p_an = sub.add_parser("analyze", help="AI candidate analysis (local loopback model only, task #5)")
+    p_an.add_argument("project", type=Path, help="path to vibecut.project.json (or its directory)")
+    p_an.add_argument("input", type=Path, help="synthetic/canonical equirect source")
+    p_an.add_argument("--focus", required=True, help="中文重点描述（人物/风景/时长/排除项）")
+    p_an.add_argument("--person-priority", action="store_true", help="人物优先")
+    p_an.add_argument("--scenery-priority", action="store_true", help="风景优先")
+    p_an.add_argument("--target-duration", type=_parse_time, default=None, metavar="SEC",
+                      help="目标总时长（秒，允许误差 ≤1s）")
+    p_an.add_argument("--endpoint", default="http://127.0.0.1:1234",
+                      help="本地回环模型服务（仅 127.0.0.1/::1/localhost，禁止公网）")
+    p_an.add_argument("--model", default=None, help="模型 ID（默认用户已选 qwen3.8-27b@q4_k_xl，探测核实）")
+    p_an.add_argument("--samples", type=int, default=12, help="全片均匀采样点数（1..64）")
+    p_an.add_argument("--projection", choices=["equirect"], default=None)
+    p_an.add_argument("--max-requests", type=int, default=32, help="模型请求预算（含重试）")
+    p_an.add_argument("--timeout", type=float, default=300.0, help="单次模型请求超时秒")
+    p_an.add_argument("--json", action="store_true", help="stdout 输出完整 JSON 结果")
+    p_an.add_argument("--allow-jit-load", action="store_true",
+                      help="模型未加载时允许首个推理请求触发 JIT 加载（需显式授权 GPU 窗口；默认拒绝无人值守加载）")
+    p_an.add_argument("--out", type=Path, default=None,
+                      help="把完整 JSON 写入一个新文件（原子写入，绝不覆盖已有文件）")
     return parser
 
 
@@ -322,6 +342,136 @@ def isinstance_output_exists(err: str) -> bool:
     return err.startswith("OutputExistsError")
 
 
+def _write_result_noclobber(out: Path, payload: dict) -> bool:
+    """Publish a result JSON atomically without ever overwriting.
+
+    Write to a unique temp file in the target directory, fsync it, then
+    publish via ``os.link`` (an atomic no-clobber create): readers either see
+    the previous file or the complete new one - never a half-written JSON.
+    Returns False when the target already exists.
+    """
+    import os
+    import tempfile
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, out)
+            return True
+        except FileExistsError:
+            return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    import threading
+
+    from vibecut.analysis import AnalysisConfig, parse_focus
+    from vibecut.analysis.errors import AnalysisError
+    from vibecut.analysis.focus import FocusError
+    from vibecut.analysis.service import DEFAULT_MODEL, analyze
+    from vibecut.analysis.transport import validate_endpoint
+    from vibecut.core.cache import Cache
+
+    tools = _resolve_tools()
+    if tools is None:
+        return EXIT_TOOLS
+    try:
+        validate_endpoint(args.endpoint)
+    except AnalysisError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    priority = "person" if args.person_priority else ("scenery" if args.scenery_priority else None)
+    try:
+        focus = parse_focus(args.focus, priority=priority, target_duration_s=args.target_duration)
+    except FocusError as exc:
+        print(f"error: --focus: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if args.out is not None and Path(args.out).exists():
+        # fail fast: never spend GPU time just to discover the target exists
+        print(f"error: output already exists (never overwritten): {args.out}", file=sys.stderr)
+        return EXIT_CONFLICT
+
+    config = AnalysisConfig(
+        endpoint=args.endpoint, model_id=args.model if args.model else DEFAULT_MODEL,
+        samples=args.samples, max_model_requests=args.max_requests, model_timeout_s=args.timeout,
+        allow_jit_load=args.allow_jit_load,
+    )
+
+    project = _load_project(args.project)
+    # Hold the project job lock from probe through revision-checked publication.
+    with project.exclusive_lock(timeout_s=0):
+        project.check_revision()
+        source, code = _probe_or_exit(args.input, tools, args.projection)
+        if source is None:
+            return code
+        for existing in project.sources.values():
+            if Path(existing.path).resolve() == Path(source.path).resolve() \
+                    and existing.content_fingerprint != source.content_fingerprint:
+                print("error: source content changed since ingest", file=sys.stderr)
+                return EXIT_CONFLICT
+        asset = next((a for a in project.assets if a.source_id == source.source_id and a.kind == "proxy"), None)
+
+        cache = Cache(Path(project.path).parent / ".vibecut-cache")
+
+        cancel_event = threading.Event()
+        try:
+            result = analyze(source, asset, tools, cache, config, focus, cancel_event=cancel_event)
+        except KeyboardInterrupt:
+            cancel_event.set()
+            print("cancelled", file=sys.stderr)
+            return EXIT_RENDER
+
+        project.check_revision()
+        payload = result.to_json()
+        if args.out is not None and not _write_result_noclobber(Path(args.out), payload):
+            print(f"error: output already exists (never overwritten): {args.out}", file=sys.stderr)
+            return EXIT_CONFLICT
+
+        if args.json:
+            import json as _json
+
+            print(_json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True))
+        else:
+            _print_analysis_summary(result)
+
+    if result.status == "ai-unavailable":
+        diag = result.diagnostics[0] if result.diagnostics else {}
+        print(f"AI 不可用（stage={diag.get('stage')} code={diag.get('code')}）：{diag.get('message', '')}", file=sys.stderr)
+        print("可人工审阅候选窗口后手动剪辑；本工具不提供规则兑底冒充 AI。", file=sys.stderr)
+        return EXIT_RENDER
+    if result.status in ("cancelled", "failed"):
+        for d in result.diagnostics:
+            print(f"analysis {d.get('status', d.get('stage'))}: {d}", file=sys.stderr)
+        return EXIT_RENDER
+    return EXIT_OK
+
+
+def _print_analysis_summary(result) -> None:
+    m = result.metering
+    plan = result.plan
+    if plan is not None:
+        print(f"选片状态: {plan.status}  片段 {len(plan.segments)} 段  "
+              f"总时长 {float(plan.total_duration_s):.1f}s / 目标 {float(plan.target_duration_s):.1f}s")
+        if plan.shortfall_reason:
+            print(f"  说明: {plan.shortfall_reason}")
+        for s in plan.segments:
+            ev = ", ".join(e.candidate_id for e in s.evidence)
+            print(f"  {s.segment_id}  {float(s.cut_in_rel):.2f}s-{float(s.cut_out_rel):.2f}s  "
+                  f"view={s.view_id}  相关度 {s.relevance:.2f}  证据[{ev}]  理由: {s.reason[:60]}")
+    print(f"候选窗口 {len(result.candidates)} 个（供人工审阅，含非 AI 廉价特征来源）")
+    print(f"计量: 推理请求 {m.request_count} 次（重试 {m.retry_count}），探测 {sum(r.get('kind') == 'probe' for r in m.requests)} 次，模型耗时 {m.model_time_s:.1f}s，"
+          f"缓存 cheap={m.cache.get('cheap_features')} 观察命中={m.cache.get('observation_batches_hit', 0)} "
+          f"未命中={m.cache.get('observation_batches_miss', 0)} 选片={m.cache.get('selection')}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     from vibecut.core.project import ProjectError
 
@@ -332,6 +482,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "inspect": _cmd_inspect,
         "add-source": _cmd_add_source,
         "export": _cmd_export,
+        "analyze": _cmd_analyze,
         "render-sequence": _cmd_sequence,
     }
     try:
