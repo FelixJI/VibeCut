@@ -422,20 +422,17 @@ def test_render_cancel_during_command_preparation_leaves_no_artifact_or_cache(to
     cancel=threading.Event()
     original=BoundCameraPath.evaluate
     count=0
-    timer=None
     def observe(self,t):
-        nonlocal count,timer
+        nonlocal count
         count+=1
+        value=original(self,t)
         if count==1:
-            timer=threading.Timer(.01,cancel.set);timer.start()
-        return original(self,t)
+            cancel.set()  # actual preparation has evaluated its first frame
+        return value
     monkeypatch.setattr(BoundCameraPath,"evaluate",observe)
     cache=Cache(tmp_path/"cache")
-    try:
-        result=render_sequence(plan,{source.source_id:source},tools,tmp_path/"cancel.mp4",
-                               StaticRenderConfig(),cancel_event=cancel,cache=cache)
-    finally:
-        if timer:timer.cancel();timer.join()
+    result=render_sequence(plan,{source.source_id:source},tools,tmp_path/"cancel.mp4",
+                           StaticRenderConfig(),cancel_event=cancel,cache=cache)
     assert result.status=="cancelled" and "command preparation" in result.error
     assert 0 < count < 3600
     assert not (tmp_path/"cancel.mp4").exists()

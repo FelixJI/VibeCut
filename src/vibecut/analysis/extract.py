@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -84,23 +85,42 @@ class AssetTiming:
     fps: Fraction
 
 
-def probe_asset_timing(tools, media_path, *, expected_fps, expected_frames):
+def probe_asset_timing(tools, media_path, *, expected_fps, expected_frames, cancel_event=None, timeout_s=30.0):
     """Reuse #2's packet validation once per asset, without hashing/decoding it."""
-    from vibecut.media.probe import _ffprobe_json, _video_packet_pts, _verify_cfr, ProbeError, UnsupportedSourceError
+    from vibecut.media.probe import (
+        _ffprobe_json, _video_packet_pts, _verify_cfr, ProbeError, UnsupportedSourceError,
+        ProbeCancelledError, ProbeTimeoutError,
+    )
+    deadline = time.monotonic() + timeout_s
+    def remaining():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProbeCancelledError("analysis asset probe cancelled")
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise ProbeTimeoutError("analysis asset probe timed out")
+        return budget
     try:
-        data = _ffprobe_json(tools, Path(media_path), ["-show_format", "-show_streams"])
+        data = _ffprobe_json(tools, Path(media_path), ["-show_format", "-show_streams"],
+                             timeout_s=remaining(), cancel_event=cancel_event)
         videos = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
         if len(videos) != 1:
             raise ExtractionError("analysis asset must contain exactly one video stream")
         video = videos[0]
         time_base = Fraction(video["time_base"])
-        pts = _video_packet_pts(tools, Path(media_path), int(video["index"]))
+        pts = _video_packet_pts(tools, Path(media_path), int(video["index"]),
+                                timeout_s=remaining(), cancel_event=cancel_event)
         first, fps = _verify_cfr(pts, time_base, Fraction(video["avg_frame_rate"]),
-                                 int(video["start_pts"]) if video.get("start_pts") is not None else None)
+                                 int(video["start_pts"]) if video.get("start_pts") is not None else None,
+                                 cancel_event=cancel_event, timeout_s=remaining())
         if fps != expected_fps or len(pts) != expected_frames:
             raise ExtractionError("asset displayed packet timing disagrees with verified source")
         origin = Fraction(data.get("format", {}).get("start_time", str(first * time_base)))
+        remaining()
         return AssetTiming(first, time_base, origin, fps)
+    except ProbeCancelledError as exc:
+        raise ModelCancelledError("analysis asset timing probe cancelled", stage="asset-timing") from exc
+    except ProbeTimeoutError as exc:
+        raise ExtractionError("analysis asset timing probe timed out", stage="asset-timing", code="timeout") from exc
     except (ProbeError, UnsupportedSourceError, KeyError, ValueError, ZeroDivisionError) as exc:
         raise ExtractionError("cannot verify analysis asset displayed timing") from exc
 

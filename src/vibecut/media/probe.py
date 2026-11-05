@@ -22,6 +22,7 @@ import json
 import os
 import re
 import threading
+import time
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +50,19 @@ class ProbeError(RuntimeError):
     pass
 
 
+class ProbeCancelledError(ProbeError):
+    pass
+
+
+class ProbeTimeoutError(ProbeError):
+    pass
+
+
+def _check_probe_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProbeCancelledError("ffprobe cancelled")
+
+
 class UnsupportedSourceError(RuntimeError):
     pass
 
@@ -73,14 +87,22 @@ def content_fingerprint(path: Path, *, chunk: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
-def _ffprobe_json(tools: FFmpegTools, path: Path, argv_extra: list[str], *, timeout_s: float = PROBE_TIMEOUT_S) -> dict[str, Any]:
+def _ffprobe_json(tools: FFmpegTools, path: Path, argv_extra: list[str], *, timeout_s: float = PROBE_TIMEOUT_S, cancel_event: Optional[threading.Event] = None) -> dict[str, Any]:
     argv = tools.ffprobe_argv("-print_format", "json", *argv_extra, "-i", str(path))
-    res = tools.run(argv, timeout_s=timeout_s)
+    _check_probe_cancel(cancel_event)
+    res = tools.run(argv, timeout_s=timeout_s, cancel_event=cancel_event)
+    _check_probe_cancel(cancel_event)
+    if res.cancelled:
+        raise ProbeCancelledError("ffprobe metadata cancelled")
+    if res.timed_out:
+        raise ProbeTimeoutError("ffprobe metadata timed out")
     if res.returncode != 0 or res.timed_out or res.cancelled or res.stderr_tail.strip():
         tail = res.stderr_tail.decode("utf-8", "replace")[-500:].strip()
         raise ProbeError(f"ffprobe failed for {path.name} (rc={res.returncode}): {tail}")
     try:
-        return json.loads(res.stdout_tail.decode("utf-8", "replace"))
+        data = json.loads(res.stdout_tail.decode("utf-8", "replace"))
+        _check_probe_cancel(cancel_event)
+        return data
     except json.JSONDecodeError as exc:
         raise ProbeError(f"ffprobe produced unparsable JSON for {path.name}: {exc}") from exc
 
@@ -158,7 +180,12 @@ def _run_ffprobe_to_tempfile(
         with os.fdopen(fd, "wb") as output:
             result = run_bounded(argv, timeout_s=timeout_s, cancel_event=cancel_event,
                                  stdout_file=output)
-        if result.timed_out or result.cancelled or result.returncode != 0:
+        _check_probe_cancel(cancel_event)
+        if result.cancelled:
+            raise ProbeCancelledError("ffprobe packet process cancelled")
+        if result.timed_out:
+            raise ProbeTimeoutError("ffprobe packet process timed out")
+        if result.returncode != 0:
             tail = result.stderr_tail.decode("utf-8", "replace")[-500:].strip()
             raise ProbeError(
                 f"ffprobe failed (rc={result.returncode}, timeout={result.timed_out}, "
@@ -170,7 +197,8 @@ def _run_ffprobe_to_tempfile(
         raise
 
 
-def _video_packet_pts(tools: FFmpegTools, path: Path, stream_index: int) -> list[int]:
+def _video_packet_pts(tools: FFmpegTools, path: Path, stream_index: int, *,
+                      timeout_s: float = PROBE_TIMEOUT_S, cancel_event: Optional[threading.Event] = None) -> list[int]:
     """Exact displayed-packet PTS, excluding decoder-only edit-list preroll.
 
     FFmpeg's packet D flag denotes discard, including positive-PTS preroll.
@@ -183,11 +211,16 @@ def _video_packet_pts(tools: FFmpegTools, path: Path, stream_index: int) -> list
         "-of", "compact=p=0:nk=0", "-select_streams", str(stream_index),
         "-show_packets", "-show_entries", "packet=pts,flags", "-i", str(path),
     ))
-    tmp = _run_ffprobe_to_tempfile(argv, timeout_s=PROBE_TIMEOUT_S)
+    _check_probe_cancel(cancel_event)
+    deadline = time.monotonic() + timeout_s
+    tmp = _run_ffprobe_to_tempfile(argv, timeout_s=timeout_s, cancel_event=cancel_event)
     pts: list[int] = []
     try:
         with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:  # streaming: bounded memory per line
+                _check_probe_cancel(cancel_event)
+                if time.monotonic() >= deadline:
+                    raise ProbeTimeoutError("ffprobe packet scan timed out")
                 if not line.strip():
                     continue
                 fields = dict(part.split("=", 1) for part in line.strip().split("|") if "=" in part)
@@ -201,10 +234,16 @@ def _video_packet_pts(tools: FFmpegTools, path: Path, stream_index: int) -> list
                     raise UnsupportedSourceError("displayed packet has no usable PTS") from exc
     finally:
         tmp.unlink(missing_ok=True)
-    return sorted(pts)
+    _check_probe_cancel(cancel_event)
+    pts.sort()
+    _check_probe_cancel(cancel_event)
+    if time.monotonic() >= deadline:
+        raise ProbeTimeoutError("ffprobe packet scan timed out")
+    return pts
 
 
-def _verify_cfr(pts: list[int], time_base: Fraction, avg_frame_rate: Fraction, stream_start_pts: Optional[int]) -> tuple[int, Fraction]:
+def _verify_cfr(pts: list[int], time_base: Fraction, avg_frame_rate: Fraction, stream_start_pts: Optional[int], *,
+                cancel_event: Optional[threading.Event] = None, timeout_s: float | None = None) -> tuple[int, Fraction]:
     """Verify constant frame timing from real packet PTS.
 
     Returns (first_displayed_pts, exact_fps).
@@ -218,7 +257,14 @@ def _verify_cfr(pts: list[int], time_base: Fraction, avg_frame_rate: Fraction, s
     """
     if len(pts) < 2:
         raise UnsupportedSourceError("fewer than 2 timestamped video packets; cannot verify frame timing")
-    deltas = {b - a for a, b in zip(pts, pts[1:])}
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    _check_probe_cancel(cancel_event)
+    deltas = set()
+    for a, b in zip(pts, pts[1:]):
+        _check_probe_cancel(cancel_event)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProbeTimeoutError("displayed packet verification timed out")
+        deltas.add(b - a)
     if len(deltas) != 1:
         d_sorted = sorted(deltas)
         raise VFRDetectedError(

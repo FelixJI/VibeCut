@@ -175,7 +175,8 @@ def analyze(
             duration = _source_duration_s(source)
             from vibecut.analysis.extract import probe_asset_timing
             asset_timing = probe_asset_timing(tools, asset.path, expected_fps=source.video.fps,
-                                              expected_frames=source.video.nb_frames)
+                                              expected_frames=source.video.nb_frames, cancel_event=cancel_event,
+                                              timeout_s=min(30.0, config.ffmpeg_timeout_s))
 
         from vibecut.analysis.views import default_view_set
         batches_per_sample = (len(default_view_set()) + config.max_images_per_request - 1) // config.max_images_per_request
