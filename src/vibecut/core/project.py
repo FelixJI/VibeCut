@@ -35,6 +35,7 @@ from vibecut.core.contracts import (
     parse_frac,
     write_json_atomic,
 )
+from vibecut.core.sequence import SequencePlan
 
 PROJECT_SCHEMA_VERSION = 1
 PROJECT_FILENAME = "vibecut.project.json"
@@ -71,6 +72,7 @@ class Project:
         assets: list[NormalizedAsset],
         plans: dict[str, EditPlan],
         jobs: list[JobEvent],
+        sequences: Optional[dict[str, SequencePlan]] = None,
     ) -> None:
         self.path = Path(path)
         self.project_id = project_id
@@ -80,6 +82,7 @@ class Project:
         self.assets = list(assets)
         self.plans = dict(plans)
         self.jobs = list(jobs)
+        self.sequences = dict(sequences or {})
         self._loaded_revision = revision
         self._lock_owner: Optional[int] = None
         self._lock_fd: Optional[int] = None
@@ -133,6 +136,7 @@ class Project:
                 assets=[NormalizedAsset.from_json(a) for a in raw.get("assets", [])],
                 plans={k: EditPlan.from_json(v) for k, v in raw.get("plans", {}).items()},
                 jobs=[JobEvent.from_json(e) for e in raw.get("jobs", [])],
+                sequences={k: SequencePlan.from_json(v) for k, v in raw.get("sequences", {}).items()},
             )
         except (KeyError, ValueError) as exc:
             raise ProjectFormatError(f"invalid project content in {path}: {exc}") from exc
@@ -151,6 +155,7 @@ class Project:
             "sources": [s.to_json() for s in self.sources.values()],
             "assets": [a.to_json() for a in self.assets],
             "plans": {k: p.to_json() for k, p in self.plans.items()},
+            "sequences": {k: p.to_json() for k, p in self.sequences.items()},
             "jobs": [e.to_json() for e in self.jobs[-MAX_JOB_EVENTS:]],
         }
 

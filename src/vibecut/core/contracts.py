@@ -1,4 +1,4 @@
-"""Versioned data contracts shared by core, media and render (schema version 1).
+"""Versioned data contracts shared by core, media and render (schema version 2).
 
 All timestamps that originate from, or map onto, media streams are exact
 rationals (:class:`fractions.Fraction`). Serialisation uses ``"num/den"``

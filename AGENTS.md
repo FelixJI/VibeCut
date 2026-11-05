@@ -11,7 +11,7 @@
 1. 核心包仅标准库；CLI 不依赖 Qt/SDK/模型；重模块惰性导入。
 2. 源时间与输出时间一律 `Fraction` 有理数；source-relative 0 = 源首个显示帧（PTS 取自实际包验证）；音视频同绝对时间线裁切；CFR 由真实包 PTS 均匀性验证（r/avg 帧率字段不作充分条件），真 VFR 提前 fail-fast，禁止 frame_index/fps 猜测。
 3. canonical 几何：yaw0=equirect 中心、正 yaw 向右、正 pitch 向上、roll 显式顺时针、合同 FOV 为水平 FOV；手工锁定优先（CameraPath provenance="user"，静态导出仅接受 user）。
-3a. 色彩：仅接受显式标记 BT.709/tv/8bit SDR；未知/非 709/全范围/HDR 一律拒绝，绝无未经真实转换的重标；投影检测仅信任结构化标记或显式声明，矛盾/立体元数据拒绝。
+3a. 色彩：仅接受显式标记 BT.709/tv/8bit 或 10bit SDR；10bit 经真实像素格式转换为 8bit 输出；未知/非 709/全范围/HDR 一律拒绝，绝无未经真实转换的重标；投影检测仅信任结构化标记或显式声明，矛盾/立体元数据拒绝。
 4. 源/既有输出永不覆盖：同目录临时写 → 子进程真实退出 → probe 验证 → 无覆盖提交 → 成功事件；工程原子 replace + 同项目跨进程独占锁 + revision 拒绝迟到事件。
 5. 缓存绑定源内容/工具/配置/色彩空间，不绑定 edit revision。
 6. 子进程：argv 直传不经 shell；有界超时/取消/管道排空/等待真实退出；Windows Job Object（或等价）只杀自家进程树；完成事件必须在产物验证后发布。
