@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -34,7 +35,8 @@ class BoundCameraPath:
         _check(all(isinstance(t, Fraction) and t >= 0 for t in times), "camera times must be nonnegative Fractions")
         _check(all(isinstance(t, Fraction) for t in self.cuts), "cut times must be Fractions")
         _check(tuple(sorted(set(self.cuts))) == self.cuts, "cuts must be strictly increasing")
-        _check(all(t in times[1:] for t in self.cuts), "cut must name a camera key after the first")
+        cut_keys = set(times[1:])
+        _check(all(t in cut_keys for t in self.cuts), "cut must name a camera key after the first")
         for _, view in self.camera.keys:
             _check(all(math.isfinite(v) for v in (view.yaw_deg, view.pitch_deg, view.roll_deg, view.h_fov_deg)), "camera values must be finite")
             _check(-90 <= view.pitch_deg <= 90, "pitch must be in [-90,90]")
@@ -44,15 +46,18 @@ class BoundCameraPath:
         """Shared preview/final evaluator; shortest yaw/roll arcs, explicit cuts."""
         keys = self.camera.keys
         _check(keys[0][0] <= source_rel <= keys[-1][0], "camera does not cover requested source time")
-        for (ta, a), (tb, b) in zip(keys, keys[1:]):
-            if source_rel < tb:
-                if tb in self.cuts:
-                    return a
-                f = float((source_rel - ta) / (tb - ta))
-                arc = lambda x, y: x + ((y - x + 180) % 360 - 180) * f
-                return CameraView(arc(a.yaw_deg, b.yaw_deg), a.pitch_deg + (b.pitch_deg - a.pitch_deg) * f,
-                                  arc(a.roll_deg, b.roll_deg), a.h_fov_deg + (b.h_fov_deg - a.h_fov_deg) * f)
-        return keys[-1][1]
+        index = bisect_right(keys, source_rel, key=lambda key: key[0])
+        if index == len(keys):
+            return keys[-1][1]
+        ta, a = keys[index - 1]
+        tb, b = keys[index]
+        cut_index = bisect_left(self.cuts, tb)
+        if cut_index < len(self.cuts) and self.cuts[cut_index] == tb:
+            return a
+        f = float((source_rel - ta) / (tb - ta))
+        arc = lambda x, y: x + ((y - x + 180) % 360 - 180) * f
+        return CameraView(arc(a.yaw_deg, b.yaw_deg), a.pitch_deg + (b.pitch_deg - a.pitch_deg) * f,
+                          arc(a.roll_deg, b.roll_deg), a.h_fov_deg + (b.h_fov_deg - a.h_fov_deg) * f)
 
     def to_json(self):
         return {"schema_version": 1, "geometry_revision": self.geometry_revision, "asset_id": self.asset_id,

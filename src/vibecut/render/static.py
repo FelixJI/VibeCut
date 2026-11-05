@@ -296,7 +296,7 @@ def render_static(
                 nvdec, nvenc, backend_events = probe_backends(tools, Path(command_dir.name), config.timeout_s, cancel_event)
                 events.extend(backend_events)
             events.append(("backend", f"decode={'nvdec' if nvdec else 'cpu'} projection=cpu-v360 encode={'nvenc' if nvenc else 'libx264'}"))
-            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name), nvdec=nvdec, nvenc=nvenc))
+            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name), nvdec=nvdec, nvenc=nvenc, cancel_event=cancel_event))
         else:
             argv = tools.ffmpeg_argv(*build_ffmpeg_argv(source, plan, config, tmp_out))
 
@@ -326,8 +326,8 @@ def render_static(
         # 3-4. run and wait for the REAL process exit
         res = tools.run(argv, timeout_s=config.timeout_s, cancel_event=cancel_event)
         if dynamic and (nvdec or nvenc) and not res.cancelled and not res.timed_out and (res.returncode != 0 or res.stderr_tail.strip()):
-            events.append(("cpu-fallback", res.stderr_tail.decode("utf-8", "replace")[-800:]))
-            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name)))
+            events.append(("cpu-fallback", res.stderr_tail.decode("utf-8", "replace")[:1200]))
+            argv = tools.ffmpeg_argv(*build_sequence_argv(sources, plan, config, tmp_out, Path(command_dir.name), cancel_event=cancel_event))
             res = tools.run(argv, timeout_s=config.timeout_s, cancel_event=cancel_event)
             events.append(("backend", "decode=cpu projection=cpu-v360 encode=libx264"))
         if res.cancelled:
@@ -392,8 +392,8 @@ def render_static(
             return _fail(exc)
         events.append(("committed", str(final)))
 
-        # 8. record cache manifest (metadata only - payloads are never duplicated)
-        if cache is not None and cache_key is not None:
+        # 8. Fresh renders publish a cache generation; hits retain the immutable manifest/payload.
+        if cache is not None and cache_key is not None and not cache_hit:
             try:
                 cache.put_atomic(
                     cache_key,

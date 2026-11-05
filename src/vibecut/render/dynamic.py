@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fractions import Fraction
 from pathlib import Path
+import time
 
 from vibecut.core.geometry import v360_args
 from vibecut.core.sequence import SequencePlan
@@ -39,11 +40,20 @@ def probe_backends(tools, directory, timeout_s, cancel_event):
     return decode, encode, runs
 
 
-def build_sequence_argv(sources, plan: SequencePlan, config, tmp_out: Path, directory: Path, *, nvdec=False, nvenc=False):
-    from vibecut.render.static import _dec
+def build_sequence_argv(sources, plan: SequencePlan, config, tmp_out: Path, directory: Path, *, nvdec=False, nvenc=False, cancel_event=None):
+    from vibecut.render.static import ArtifactProcessError, _dec
+    deadline = time.monotonic() + config.timeout_s
+
+    def check_preparation():
+        if cancel_event is not None and cancel_event.is_set():
+            raise ArtifactProcessError("cancelled during camera command preparation")
+        if time.monotonic() >= deadline:
+            raise ArtifactProcessError("camera command preparation timed out")
+
     args = ["-xerror", "-err_detect", "explode", "-copyts"]
     graph = []
     for i, clip in enumerate(plan.clips):
+        check_preparation()
         src = sources[clip.source_id]
         if nvdec:
             args += ["-hwaccel", "cuda"]
@@ -53,11 +63,13 @@ def build_sequence_argv(sources, plan: SequencePlan, config, tmp_out: Path, dire
         commands = directory / f"camera-{i}.txt"
         with commands.open("w", encoding="utf-8", newline="\n") as fh:
             for n in range(frames):
+                check_preparation()
                 t = Fraction(n) / plan.project_fps
                 view = clip.path.evaluate(clip.cut_in_rel + t)
                 opts = v360_args(view, config.out_width, config.out_height)
                 # reset_rot=1 makes each command an absolute orientation; rorder is initialization-only.
                 fh.write(_dec(t) + " " + ", ".join(f"v360@cam{i} {k} {opts[k]}" for k in ("yaw", "pitch", "roll", "h_fov", "v_fov")) + ";\n")
+        check_preparation()
         opts = v360_args(clip.path.evaluate(clip.cut_in_rel), config.out_width, config.out_height)
         projection = f"v360@cam{i}=e:flat:rorder=ypr:reset_rot=1:" + ":".join(f"{k}={opts[k]}" for k in ("w", "h", "yaw", "pitch", "roll", "h_fov", "v_fov"))
         graph.append(f"[{i}:{src.video.index}]trim=start={_dec(start)}:end={_dec(end)},"

@@ -2,6 +2,7 @@
 import json
 import math
 import threading
+import time
 from dataclasses import replace
 from fractions import Fraction as F
 
@@ -16,6 +17,60 @@ from vibecut.core.sequence import BoundCameraPath, SequenceClip, SequencePlan
 from vibecut.media.probe import probe_source
 from vibecut.render.dynamic import render_sequence
 from vibecut.render.static import StaticRenderConfig, render_config_identity
+
+
+def test_dense_camera_lookup_does_not_scan_all_keys():
+    class CountedTime(F):
+        comparisons = 0
+        def __lt__(self, other):
+            type(self).comparisons += 1
+            return super().__lt__(other)
+        def __gt__(self, other):
+            type(self).comparisons += 1
+            return super().__gt__(other)
+    keys = tuple((CountedTime(n,30),CameraView(n/20)) for n in range(3601))
+    camera = path("asset",F(120),keys=keys)
+    CountedTime.comparisons=0
+    for n in range(3600):
+        assert abs(camera.evaluate(F(2*n+1,60)).yaw_deg-(n+.5)/20)<1e-8
+    assert CountedTime.comparisons < 3600*30
+    print("DENSE_LOOKUP_EVIDENCE comparisons",CountedTime.comparisons,"queries",3600)
+
+
+@pytest.mark.parametrize("mode",["cancel","timeout"])
+def test_command_preparation_is_interruptible_after_it_started(tmp_path,monkeypatch,mode):
+    from types import SimpleNamespace
+    from vibecut.render.dynamic import build_sequence_argv
+    from vibecut.render.static import ArtifactProcessError
+    keys=tuple((F(n,30),CameraView(n/20)) for n in range(3601))
+    camera=path("asset",F(120),keys=keys)
+    plan=SequencePlan((SequenceClip("asset",F(0),F(120),camera),),F(30),audio=False)
+    # The graph builder consumes verified metadata only; it never opens media or runs FFmpeg.
+    source=SimpleNamespace(path="synthetic.mp4",video=SimpleNamespace(index=0),audio=None,
+                           cut_window_absolute=lambda start,end:(start,end))
+    cancel=threading.Event()
+    original=BoundCameraPath.evaluate
+    evaluations=0
+    timer=None
+    def observe(self,source_rel):
+        nonlocal evaluations,timer
+        evaluations+=1
+        if evaluations==1 and mode=="cancel":
+            timer=threading.Timer(.01,cancel.set);timer.start()
+        return original(self,source_rel)
+    monkeypatch.setattr(BoundCameraPath,"evaluate",observe)
+    started=time.monotonic()
+    try:
+        with pytest.raises(ArtifactProcessError,match="cancelled.*preparation" if mode=="cancel" else "preparation timed out"):
+            build_sequence_argv({"asset":source},plan,StaticRenderConfig(timeout_s=.01 if mode=="timeout" else 5),
+                                tmp_path/"out.mp4",tmp_path,cancel_event=cancel)
+    finally:
+        if timer:timer.cancel();timer.join()
+    elapsed=time.monotonic()-started
+    assert 0 < evaluations < 3600
+    assert elapsed < 1
+    assert not (tmp_path/"out.mp4").exists()
+    print("PREPARATION_EVIDENCE",mode,"evaluated_frames",evaluations,"elapsed",elapsed)
 
 
 def path(asset, duration, *, aspect="16:9", keys=None, cuts=()):
@@ -76,12 +131,27 @@ def test_dynamic_smoke_backends_and_no_clobber(tools, tmp_path):
     cancel = threading.Event(); cancel.set()
     failed = render_sequence(plan, {source.source_id: source}, tools, tmp_path / "cancel.mp4", config, cache=cache, cancel_event=cancel)
     assert failed.status == "cancelled" and failed.artifact is None and failed.cache_key is None
-    # A real unsupported NVENC output size must retry the identical sequence on CPU.
-    small = render_sequence(plan, {source.source_id: source}, tools, tmp_path / "small.mp4",
-                            replace(config, out_width=160, out_height=90))
+    # RTX 4090 accepts 160x90; 32x18 was actually probed to fail NVENC initialization.
+    cut_plan = sequence(source, start=F(3,30), end=F(9,30),
+                        keys=((F(0),CameraView(0)),(F(12,30),CameraView(40,10,5,70))))
+    small_config = replace(config, out_width=32, out_height=18)
+    small_out = tmp_path / "small.mp4"
+    small = render_sequence(cut_plan, {source.source_id: source}, tools, small_out, small_config)
     assert small.status == "succeeded", small.error
     if any(name == "nvenc-probe" and note.startswith("available") for name, note in small.events):
         assert any(name == "cpu-fallback" for name, _ in small.events)
+        assert any("InitializeEncoder failed" in note for name,note in small.events if name=="cpu-fallback")
+    cpu = render_sequence(cut_plan, {source.source_id: source}, tools, tmp_path / "small-cpu.mp4",
+                          replace(small_config, backend="cpu"))
+    assert cpu.status == "succeeded", cpu.error
+    fallback_frames = decode_gray_frames(tools, small_out, 32, 18)
+    assert len(fallback_frames) == 6
+    assert first_bright_frame_index(fallback_frames,32,18)==3
+    assert fallback_frames == decode_gray_frames(tools, cpu.artifact, 32, 18)
+    preserved = small_out.read_bytes()
+    conflict = render_sequence(cut_plan,{source.source_id:source},tools,small_out,small_config)
+    assert conflict.status=="failed" and "OutputExistsError" in conflict.error
+    assert small_out.read_bytes()==preserved
     print("FALLBACK_EVIDENCE", small.events)
 
 
@@ -321,6 +391,59 @@ def test_dynamic_output_path_survives_both_filter_escape_layers(tools, tmp_path)
     assert result.status == "succeeded", result.error
     assert len(decode_gray_frames(tools, out, 320, 180)) == 6
     assert not list(directory.glob(".vibecut-camera-*"))
+
+
+@requires_ffmpeg
+def test_repeated_preview_hits_reuse_one_immutable_cache_payload(tools,tmp_path):
+    src=make_marker_equirect(tools,tmp_path/"source.mp4",yaw_deg=0,pitch_deg=0,frames=6)
+    source=probe_source(src,tools,declared_projection="equirect")
+    plan=sequence(source)
+    cache=Cache(tmp_path/"cache")
+    config=StaticRenderConfig(out_width=320,out_height=180,preview=True)
+    first=render_sequence(plan,{source.source_id:source},tools,tmp_path/"preview0.mp4",config,cache=cache)
+    assert first.status=="succeeded",first.error
+    initial={p.name:(p.stat().st_size,p.stat().st_mtime_ns) for p in cache.root.iterdir()}
+    manifest=(cache.root/f"{first.cache_key}.json").read_bytes()
+    assert len(initial)==2
+    for n in range(1,4):
+        hit=render_sequence(plan,{source.source_id:source},tools,tmp_path/f"preview{n}.mp4",config,cache=cache)
+        assert hit.status=="succeeded",hit.error
+        assert any(name=="cache-hit" for name,_ in hit.events)
+        assert {p.name:(p.stat().st_size,p.stat().st_mtime_ns) for p in cache.root.iterdir()}==initial
+        assert (cache.root/f"{first.cache_key}.json").read_bytes()==manifest
+    assert cache.invalidate(first.cache_key)
+    assert list(cache.root.iterdir())==[]
+
+
+@requires_ffmpeg
+def test_render_cancel_during_command_preparation_leaves_no_artifact_or_cache(tools,tmp_path,monkeypatch):
+    src=make_luma_step_video(tools,tmp_path/"source.mp4",width=320,height=160,fps=F(30),frames=60,step_frame=30)
+    source=probe_source(src,tools,declared_projection="equirect")
+    # Dense output sampling makes preparation observable without producing a long input fixture.
+    keys=tuple((F(n,1800),CameraView(n/20)) for n in range(3601))
+    plan=sequence(source,keys=keys,fps=F(1800))
+    cancel=threading.Event()
+    original=BoundCameraPath.evaluate
+    count=0
+    timer=None
+    def observe(self,t):
+        nonlocal count,timer
+        count+=1
+        if count==1:
+            timer=threading.Timer(.01,cancel.set);timer.start()
+        return original(self,t)
+    monkeypatch.setattr(BoundCameraPath,"evaluate",observe)
+    cache=Cache(tmp_path/"cache")
+    try:
+        result=render_sequence(plan,{source.source_id:source},tools,tmp_path/"cancel.mp4",
+                               StaticRenderConfig(),cancel_event=cancel,cache=cache)
+    finally:
+        if timer:timer.cancel();timer.join()
+    assert result.status=="cancelled" and "command preparation" in result.error
+    assert 0 < count < 3600
+    assert not (tmp_path/"cancel.mp4").exists()
+    assert not list(tmp_path.glob("*.partial")) and not list(tmp_path.glob(".vibecut-camera-*"))
+    assert not list(cache.root.glob("*.json"))
 
 
 @requires_ffmpeg
